@@ -134,5 +134,5 @@ FROM orders AS O;
     ctx.echo(ctx.style("Next steps:", fg="green", bold=True))
     ctx.echo("  • mesa init my-project — scaffold your own four-tier project")
     ctx.echo("  • mesa new entity Customer --from-ddl schema.sql — onboard a table")
-    ctx.echo("  • Read the docs: https://github.com/mesa-platform/mesa-core")
+    ctx.echo("  • Read the docs: https://github.com/Mesantic/mesa-core")
     ctx.echo("")

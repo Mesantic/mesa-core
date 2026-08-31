@@ -44,7 +44,7 @@ dev = [
 mesa = "mesa_core.cli:cli"
 
 [project.urls]
-Homepage = "https://github.com/mesa-platform/mesa-core"
+Homepage = "https://github.com/Mesantic/mesa-core"
 
 [tool.setuptools.packages.find]
 where = ["."]

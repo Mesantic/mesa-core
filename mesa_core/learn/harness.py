@@ -206,5 +206,5 @@ That's the whole pitch. Go tell someone.
 Next steps:
   • `mesa init my-project` — scaffold your own four-tier project
   • `mesa new entity Customer --from-ddl schema.sql` — onboard an existing table
-  • Read the docs: https://github.com/mesa-platform/mesa-core
+  • Read the docs: https://github.com/Mesantic/mesa-core
 """)
