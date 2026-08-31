@@ -1,0 +1,400 @@
+# ------------------------------------------------------------------------
+# mesa-core (c) 2026 Mesantic LLC. MIT License (see LICENSE).
+# MESA(tm) and Mesantic(tm) are trademarks of Mesantic LLC.
+# ------------------------------------------------------------------------
+"""
+compiler/targets/cube.py
+=========================
+CubeEmitter — SPEC_39-B
+
+Turns a governed entity + metrics + view into Cube.dev YAML artifacts
+(model/cubes/<entity_snake>.yml and optionally model/views/<view_snake>.yml).
+
+Design guarantees
+-----------------
+* emit() is PURE and DETERMINISTIC — no git I/O, no network, no DB.
+  All side-effectful git writing lives in integrations/definitions/git_writer.py.
+* Mirrors the PROVEN pattern from CubeDev/cube_takehome:
+    mesa_*_sql / mesa_*_measures → model/cubes/*.yml + model/views/*.yml
+* Fold invariant (from SPEC_38): emit() ALWAYS folds ALL metrics into the cube
+  SQL (widetable join). A single-metric redeploy triggered by metric_names still
+  emits the full cube so no measures are dropped from the deployed cube.
+* CodeConnection is stored but only used for the `target` context comment —
+  actual git I/O happens outside this class.
+
+Aggregation mapping
+-------------------
+The cube `type` is inferred from the metric's definition_sql expression:
+
+  Pattern in expression            Cube measure type
+  ────────────────────────────────────────────────────
+  SUM(...)                         sum
+  COUNT DISTINCT(...)              count_distinct
+  COUNT(...)                       count
+  AVG(...)                         avg
+  MAX(...)                         max
+  MIN(...)                         min
+  (none of the above)              number  (with the raw sql expression)
+
+This heuristic covers the canonical MESA metric patterns.  Unusual expressions
+compile to `number` with the raw SQL, which Cube.dev accepts.
+
+Wire-label preservation
+-----------------------
+No MESA tier wire labels (raw/metric/widetable/view) appear in Cube artifacts.
+The Cube artifact kind is always "file" and the object_type identifies the
+Cube artifact role: "cube_model" or "cube_view".
+"""
+
+from __future__ import annotations
+
+import re
+import textwrap
+from datetime import datetime, timezone
+
+from mesa_core.compiler.targets.base import Artifact
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _snake(name: str) -> str:
+    """
+    Convert a PascalCase / mixed-case identifier to snake_case.
+    Examples:
+        Customer      → customer
+        StakingEvents → staking_events
+        FeeEvents     → fee_events
+        revenueMetric → revenue_metric
+    """
+    s1 = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
+    return s2.lower()
+
+
+def _infer_cube_measure_type(definition_sql: str) -> tuple[str, str]:
+    """
+    Infer the Cube measure `type` and `sql` from a MESA metric definition_sql.
+
+    Returns:
+        (cube_type, cube_sql)
+
+        cube_type : Cube.dev measure type string.
+        cube_sql  : The SQL expression to use in the measure block.
+                    For sum/avg/max/min this is the inner expression.
+                    For count_distinct/count this is the counted column.
+                    For `number` this is the raw expression.
+
+    The definition_sql is expected to be the RHS of the metric expression
+    as stored in Metric.definition_sql, e.g.:
+        "SUM(amount)"
+        "COUNT(DISTINCT customer_id)"
+        "AVG(ltv_score)"
+        "revenue - cost"   (arbitrary expression → number)
+    """
+    if not definition_sql:
+        return ("number", "1")
+
+    expr = definition_sql.strip()
+
+    # COUNT DISTINCT / COUNT(DISTINCT ...) → count_distinct
+    count_distinct_re = re.compile(
+        r"(?i)^COUNT\s*\(\s*DISTINCT\s+(.+)\s*\)\s*$"
+    )
+    m = count_distinct_re.match(expr)
+    if m:
+        return ("count_distinct", m.group(1).strip())
+
+    # SUM(...) → sum
+    m = re.match(r"(?i)^SUM\s*\((.+)\)\s*$", expr)
+    if m:
+        return ("sum", m.group(1).strip())
+
+    # COUNT(...) → count
+    m = re.match(r"(?i)^COUNT\s*\((.+)\)\s*$", expr)
+    if m:
+        return ("count", m.group(1).strip())
+
+    # AVG(...) → avg
+    m = re.match(r"(?i)^AVG\s*\((.+)\)\s*$", expr)
+    if m:
+        return ("avg", m.group(1).strip())
+
+    # MAX(...) → max
+    m = re.match(r"(?i)^MAX\s*\((.+)\)\s*$", expr)
+    if m:
+        return ("max", m.group(1).strip())
+
+    # MIN(...) → min
+    m = re.match(r"(?i)^MIN\s*\((.+)\)\s*$", expr)
+    if m:
+        return ("min", m.group(1).strip())
+
+    # Fallback → number with the raw expression
+    return ("number", expr)
+
+
+def _generated_header(entity_name: str) -> str:
+    """Return the GENERATED-BY comment block for every generated file."""
+    ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (
+        f"# GENERATED BY MESANTIC — source of truth is the governed {entity_name} contract.\n"
+        f"# Do not edit by hand; re-run deploy(target=cube). Rendered {ts}.\n"
+    )
+
+
+def _build_widetable_sql(
+    entity_name: str,
+    identity_col: str,
+    all_metrics: list,
+) -> str:
+    """
+    Build the Cube cube `sql:` block — the widetable fold SQL.
+
+    Replicates the MESA 4-tier widetable assembly pattern:
+      Base = the entity's raw/identity table (LEFT JOIN anchor)
+      Each metric = LEFT JOIN <entity>_<metric>Metric USING (<identity_col>)
+
+    This is the SAME fold logic as _build_widetable_ddl() in deployment.py,
+    adapted to produce a plain SQL fragment (no CREATE TABLE wrapper) suitable
+    for Cube's `sql:` field.
+
+    All metrics are always folded (fold invariant from SPEC_38).
+    """
+    entity_snake = _snake(entity_name)
+    if not all_metrics:
+        return f"SELECT {{{{ {entity_snake}.{identity_col} }}}} FROM {{{{ {entity_snake} }}}}"
+
+    selects = [f"base.{identity_col}"] + [
+        f"m{i}.{m.metric_name}" for i, m in enumerate(all_metrics)
+    ]
+    select_clause = ",\n  ".join(selects)
+
+    joins = "\n  ".join(
+        f"LEFT JOIN mesa_metric.{entity_name}_{m.metric_name}Metric m{i}"
+        f" ON base.{identity_col} = m{i}.{identity_col}"
+        for i, m in enumerate(all_metrics)
+    )
+
+    return (
+        f"SELECT\n"
+        f"  {select_clause}\n"
+        f"FROM mesa_raw.{entity_name}Raw base\n"
+        f"  {joins}"
+    )
+
+
+def _build_cube_yml(
+    entity_name: str,
+    identity_col: str,
+    all_metrics: list,
+    header: str,
+) -> str:
+    """
+    Render the model/cubes/<entity_snake>.yml file body.
+
+    Structure:
+        cubes:
+          - name: <entity_snake>
+            sql: >
+              <widetable fold sql>
+            dimensions:
+              - name: <identity_snake>
+                sql: "{TABLE}.<identity_col>"
+                type: string
+                primary_key: true
+            measures:
+              - name: <metric_snake>
+                sql: "{TABLE}.<measure_sql>"
+                type: <cube_type>
+                # description: ...
+    """
+    entity_snake = _snake(entity_name)
+    id_snake = _snake(identity_col)
+
+    fold_sql = _build_widetable_sql(entity_name, identity_col, all_metrics)
+    # Indent the fold SQL for YAML literal block scalar (> or |)
+    indented_sql = textwrap.indent(fold_sql, "      ")
+
+    lines: list[str] = [
+        header,
+        "cubes:",
+        f"  - name: {entity_snake}",
+        f"    sql: >",
+        indented_sql,
+        "",
+        "    dimensions:",
+        f"      - name: {id_snake}",
+        f'        sql: "{{TABLE}}.{identity_col}"',
+        f"        type: string",
+        f"        primary_key: true",
+        "",
+        "    measures:",
+    ]
+
+    for metric in all_metrics:
+        m_snake = _snake(metric.metric_name)
+        definition = getattr(metric, "definition_sql", None) or getattr(metric, "sql_definition", "") or ""
+        cube_type, cube_sql = _infer_cube_measure_type(definition)
+        description = getattr(metric, "description", None)
+
+        lines.append(f"      - name: {m_snake}")
+        lines.append(f'        sql: "{{TABLE}}.{metric.metric_name}"')
+        lines.append(f"        type: {cube_type}")
+        if cube_type == "number":
+            # For arbitrary expressions, embed the raw sql comment so engineers know
+            lines.append(f"        # raw expression: {cube_sql}")
+        if description:
+            lines.append(f"        description: {description!r}")
+
+    lines.append("")  # trailing newline
+    return "\n".join(lines)
+
+
+def _build_view_yml(
+    entity_name: str,
+    view_name: str,
+    all_metrics: list,
+    identity_col: str,
+    header: str,
+) -> str:
+    """
+    Render the model/views/<view_snake>.yml file body.
+
+    Exposes the cube as a public, BI/agent-queryable view.
+    """
+    entity_snake = _snake(entity_name)
+    view_snake = _snake(view_name)
+    id_snake = _snake(identity_col)
+
+    lines: list[str] = [
+        header,
+        "views:",
+        f"  - name: {view_snake}",
+        "",
+        "    cubes:",
+        f"      - join_path: {entity_snake}",
+        f"        prefix: false",
+        f"        includes:",
+        f"          - {id_snake}",
+    ]
+    for metric in all_metrics:
+        m_snake = _snake(metric.metric_name)
+        lines.append(f"          - {m_snake}")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ── CubeEmitter ───────────────────────────────────────────────────────────────
+
+class CubeEmitter:
+    """
+    Compile target: Cube.dev YAML files (model/cubes/*.yml, model/views/*.yml).
+
+    emit() returns kind="file" Artifacts.  All git I/O happens OUTSIDE this
+    class in integrations/definitions/git_writer.GitWriter.
+
+    Fold invariant
+    --------------
+    Even if metric_names is supplied (SPEC_38 single-metric redeploy), this
+    emitter ALWAYS emits the full cube — all measures included.  Partial
+    cubes would silently drop measures from the deployed Cube instance.
+    The metric_names list is reflected in the PR description (via the
+    health_issues metadata channel) so the GitWriter can annotate the PR body.
+    """
+
+    target_name: str = "cube"
+
+    def __init__(self, *, code_connection: object | None = None) -> None:
+        """
+        Parameters
+        ----------
+        code_connection : optional context object (Mesantic passes a CodeConnection
+            ORM row; MESA Core passes None). Stored for parity but never read —
+            this emitter is pure and produces the same Artifacts either way.
+        """
+        self._cc = code_connection
+
+    # ------------------------------------------------------------------
+    # TargetEmitter protocol implementation
+    # ------------------------------------------------------------------
+
+    def emit(
+        self,
+        entity,
+        metrics,
+        view,
+        *,
+        layers: list[str] | None = None,
+        metric_names: list[str] | None = None,
+        location_overrides: dict | None = None,
+    ) -> list[Artifact]:
+        """
+        Generate Cube.dev YAML Artifacts for the governed contract.
+
+        Parameters
+        ----------
+        entity       : Entity ORM instance.
+        metrics      : list[Metric] ORM instances for this entity.
+        view         : Optional View ORM instance (published, authored view).
+        layers       : Ignored for Cube target — all measures always emitted.
+        metric_names : SPEC_38 single-metric redeploy signal.
+                       Carry-through only: the FULL cube is always emitted
+                       (fold invariant). The metric_names list is recorded in
+                       Artifact.health_issues as a special "redeployed_metrics"
+                       marker so the GitWriter can annotate the PR description.
+                       health_issues is [] (no actual issues) for a healthy cube.
+        location_overrides : Ignored for Cube target (repo paths are fixed).
+
+        Returns
+        -------
+        list[Artifact] where every Artifact has kind="file".
+        """
+        entity_name: str = entity.entity_name
+        identity_col: str = entity.identity_column
+        entity_snake = _snake(entity_name)
+        all_metrics = list(metrics)
+
+        header = _generated_header(entity_name)
+
+        artifacts: list[Artifact] = []
+
+        # 1. Cube model file: model/cubes/<entity_snake>.yml
+        cube_yml = _build_cube_yml(entity_name, identity_col, all_metrics, header)
+        cube_path = f"model/cubes/{entity_snake}.yml"
+
+        # The health_issues field carries a "redeployed_metrics:<list>" marker when
+        # metric_names is set. The GitWriter reads this to annotate the PR body.
+        # It is NOT a blockable health issue — the health gate check in the route
+        # handler ignores "redeployed_metrics:" prefixed entries.
+        cube_health: list[str] = []
+        if metric_names:
+            cube_health = [f"redeployed_metrics:{','.join(metric_names)}"]
+
+        artifacts.append(Artifact(
+            kind="file",
+            object_type="cube_model",
+            name=f"{entity_snake}_cube",
+            path=cube_path,
+            body=cube_yml,
+            health_issues=cube_health,
+        ))
+
+        # 2. View file: model/views/<view_snake>.yml (only when a published view exists)
+        if view is not None:
+            view_name: str = getattr(view, "view_name", entity_name)
+            view_snake = _snake(view_name)
+            view_yml = _build_view_yml(
+                entity_name, view_name, all_metrics, identity_col, header
+            )
+            view_path = f"model/views/{view_snake}.yml"
+            artifacts.append(Artifact(
+                kind="file",
+                object_type="cube_view",
+                name=f"{view_snake}_cube_view",
+                path=view_path,
+                body=view_yml,
+                health_issues=[],
+            ))
+
+        return artifacts

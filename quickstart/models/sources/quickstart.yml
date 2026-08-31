@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: quickstart
+    database: quickstart
+    schema: main
+    tables:
+      - name: customer
+        description: One row per customer (DuckDB example data).
+      - name: orders
+        description: One row per order (DuckDB example data).

@@ -1,0 +1,5 @@
+name: quickstart
+version: '1.0.0'
+default_warehouse: DuckDB
+model-paths: ["models"]
+target-dir: target

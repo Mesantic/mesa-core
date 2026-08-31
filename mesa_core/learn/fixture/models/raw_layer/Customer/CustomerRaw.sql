@@ -1,0 +1,55 @@
+-- ------------------------------------------------------------------------
+-- MESA(tm) tutorial fixture -- a Mesantic LLC product -- mesantic.com
+-- Copyright (c) 2026 Mesantic LLC. Licensed under the MIT License.
+-- MESA(tm) and Mesantic(tm) are trademarks of Mesantic LLC.
+-- ------------------------------------------------------------------------
+
+-- RAW ENTITY: Customer
+-- Grain: one row per customer (across ALL source systems — Salesforce + NetSuite)
+-- ID: hashed primary key — BASE64(SHA256(source_system || '-' || id))
+-- Doctrine: Identity collision prevention. source_system is MANDATORY in the hash input.
+--           Without it, Salesforce customer 123 and NetSuite customer 123 produce the
+--           SAME hash and silently merge into one row (the fat-finger join).
+--           This is Lesson 1's teaching moment — watch it break, then watch it refuse.
+
+{{ config(tags=['raw_customer']) }}
+
+-- UNION both sources: Salesforce + NetSuite
+WITH Salesforce AS (
+    SELECT
+        'salesforce' AS source_system,
+        SF.id AS source_id,
+        SF.name,
+        SF.signup_date,
+        SF.region
+    FROM {{ source('tutorial', 'salesforce_customers') }} AS SF
+),
+
+NetSuite AS (
+    SELECT
+        'netsuite' AS source_system,
+        NS.id AS source_id,
+        NS.name,
+        NS.signup_date,
+        NS.region
+    FROM {{ source('tutorial', 'netsuite_customers') }} AS NS
+),
+
+Combined AS (
+    SELECT * FROM Salesforce
+    UNION ALL
+    SELECT * FROM NetSuite
+)
+
+SELECT
+    -- Hashed identity with source_system prefix (prevents collision)
+    base64(sha256(Combined.source_system || '-' || CAST(Combined.source_id AS VARCHAR))) AS ID,
+    Combined.name AS Name,
+    CAST(Combined.signup_date AS DATE) AS SignupDate,
+    Combined.region AS Region,
+    -- System STRUCT: quarantine source-specific fields
+    STRUCT(
+        Combined.source_system AS SourceSystem,
+        Combined.source_id AS SourceID
+    ) AS Source
+FROM Combined

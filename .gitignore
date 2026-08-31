@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.sqlfluff*
+.DS_Store
+
+# Runtime scratch dir created by `mesa learn` (progress file, working DuckDB
+# copy, generated scratch SQL) — never commit this. NOT the same as the
+# tutorial fixture's checked-in mesa_core/learn/fixture/target/ output.
+.mesa_learn/
+*.duckdb
+
+# `mesa build` output for real user projects (not the fixture's target/,
+# which is intentionally committed as a worked example for `mesa learn`).
+/target/
+!mesa_core/learn/fixture/target/

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesa-core"
+version = "0.1.0"
+description = "MESA Core — the free, MIT-licensed semantic compiler. Compile on-disk four-tier definitions (raw/metric/wide/view) into dialect-correct SQL with MESA's opinionated validation, locally, with no account and no database."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+  { name = "Mesantic LLC" }
+]
+keywords = ["semantic-layer", "metrics", "dbt", "data-engineering", "governance", "sql"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+]
+
+# MESA Core is a pure, stateless compiler. These are its ONLY runtime deps —
+# no fastapi, no sqlalchemy, no aiosqlite, no pydantic, no web/DB/ORM stack.
+dependencies = [
+  "sqlglot>=25.0",
+  "click>=8.1",
+  "pyyaml>=6.0",
+  "duckdb>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "sqlfluff>=3.0",
+]
+
+[project.scripts]
+mesa = "mesa_core.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/mesa-platform/mesa-core"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mesa_core*"]

@@ -1,0 +1,8 @@
+name: mesa_learn_tutorial
+version: 1.0.0
+default_warehouse: DuckDB
+profile: learn_tutorial
+
+# This is the fixture project for `mesa learn` — a runnable mini four-tier
+# project that demonstrates MESA's vocabulary by letting users watch things
+# break (collision, silent schema change) then watch MESA catch them.

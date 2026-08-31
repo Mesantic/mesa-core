@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: tutorial
+    database: tutorial
+    schema: main
+    tables:
+      - name: salesforce_customers
+        description: Customer data from Salesforce (has id=123 collision)
+      - name: netsuite_customers
+        description: Customer data from NetSuite (has id=123 collision)
+      - name: orders
+        description: Order transactions linked to customers via source_system
