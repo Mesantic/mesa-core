@@ -1,4 +1,15 @@
-# MESA Core
+# MESA — Metric Encapsulated Semantic Architecture
+
+**mesa-core** is the open-source compiler and standards library for MESA
+(Metric Encapsulated Semantic Architecture) — a four-tier semantic data
+architecture framework (Raw → Metric → Wide → View) for governed, versioned,
+metric-first data warehouse design.
+
+MESA compiles canonical entity, metric, and relationship definitions into
+platform-specific SQL (Snowflake, BigQuery, and others), enforcing one
+authoritative definition per business object and one file per metric.
+
+---
 
 The free, MIT-licensed semantic compiler. MESA Core is the dbt-Core equivalent
 for the MESA architecture: it reads on-disk four-tier definition files and
