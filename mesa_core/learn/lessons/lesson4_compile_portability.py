@@ -78,7 +78,7 @@ def run(ctx: LessonContext) -> None:
     ctx.echo("warehouse SQL dialects. Look at the Wide Layer SELECT statements:")
     ctx.echo("")
     ctx.echo(ctx.style("  BigQuery:", fg="yellow") + "   SELECT Customer, CustomerMetric")
-    ctx.echo(ctx.style("  Snowflake:", fg="yellow") + "  SELECT {{ as_struct('Customer') }}, {{ as_struct('CustomerMetric') }}")
+    ctx.echo(ctx.style("  Snowflake:", fg="yellow") + "  two OBJECT_CONSTRUCT(alias.*) columns, joined to a combiner model")
     ctx.echo(ctx.style("  DuckDB:", fg="yellow") + "     SELECT {{ dbt_utils.star(...) }}")
     ctx.echo("")
     ctx.echo("Same source file. Dialect-correct output every time. Warehouse as a")

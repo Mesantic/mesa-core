@@ -1,43 +1,35 @@
 # Contributing to MESA Core
 
-MESA Core is the free, stateless compiler — the forkable standard syntax for the
-four-tier architecture. Mesantic is the paid, stateful hosted layer that sits on
-top of the same compiler.
+MESA Core is the compiler for the four-tier architecture: the parser, the
+validation rules, the formatter, and the warehouse dialects. It's designed to
+run standalone, on one machine, with no external services.
 
-## The line (non-negotiable)
+## Keep it dependency-free
 
-MESA Core is **pure, stateless, one-shot** — same input always yields the same
-output, no memory of the past, no watching of the future, no human coordination.
+MESA Core must never import `fastapi`, `sqlalchemy`, `aiosqlite`, `pydantic`,
+or anything under `api.*`. Runtime dependencies are limited to `sqlglot`,
+`click`, `pyyaml`, and `duckdb`.
 
-That means, concretely, the package must NEVER import `fastapi`, `sqlalchemy`,
-`aiosqlite`, `pydantic`, or anything under `api.*`. The only runtime dependencies
-are `sqlglot`, `click`, `pyyaml`, and `duckdb`.
-
-Before a PR, run the import-purity gate:
+Check before opening a PR:
 
 ```
 grep -rnE '^\s*(import|from)\s+(fastapi|sqlalchemy|aiosqlite|pydantic|api)\b|^\s*from\s+api\.' mesa_core --include='*.py'
 ```
 
-It must print nothing.
+It should print nothing. A PR that adds one of these will fail CI.
 
-## What goes where
+## Scope for PRs
 
-- **Free (here):** the compiler, the validation brain (`grain_guard`,
-  `core_rules`, `mesa_verifier`), the formatter, all warehouse dialects, the CLI,
-  and the mechanical `mesa new entity` scaffolder.
-- **Paid (Mesantic, not here):** drift, discovery, ontology, gold-table
-  decomposition, approvals, audit chains, RBAC, billing, the hosted server.
-
-## Hard boundaries
-
-1. All warehouse dialects ship free — never paywall one.
-2. `mesa new entity` reads a **column list only**. It must never parse,
-   interpret, or classify an existing gold table's CTEs or metric logic — that
-   is Mesantic's job (SPEC_63), permanently out of scope.
-3. Behavior-preserving extraction. The compiler is extracted from Mesantic's
-   governance repo; don't "improve" it while extracting it. Parity is proven by
-   the CAO acceptance diff.
+- Compiler, validation rules (`grain_guard`, `core_rules`, `mesa_verifier`),
+  formatter, warehouse dialects, CLI, and the `mesa new entity` scaffolder are
+  all in scope here.
+- `mesa new entity` only reads a column list — it doesn't parse, interpret, or
+  classify an existing table's CTEs or metric logic. That kind of analysis is
+  out of scope for this repo.
+- This compiler was extracted from a larger internal repo, so keep changes
+  behavior-preserving rather than introducing new behavior in the same PR —
+  open a separate PR for behavior changes so they're easy to review on their
+  own.
 
 ## Tests
 

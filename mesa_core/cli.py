@@ -195,11 +195,17 @@ def new_entity(entity: str, from_columns, from_ddl, from_duckdb, duckdb_path, mo
     click.echo(click.style(
         "Fill in the grain, natural key, and which columns are enrichment vs "
         "system-STRUCT vs link-carrier, then `mesa validate`.", fg="yellow"))
+    click.echo(click.style(
+        "Wide-layer stub created — remember to run `mesa compile "
+        f"{result.entity_name}` (or `mesa build`) again once you've added its first "
+        "metric file, and every time metrics change.", fg="yellow"))
 
 
 @cli.command()
 @click.option("--models-dir", default="models", metavar="DIR", help="Models directory.")
-def build(models_dir: str) -> None:
+@click.option("--check", "check_only", is_flag=True,
+              help="CI drift mode: exit non-zero if any committed wide-layer file would change.")
+def build(models_dir: str, check_only: bool) -> None:
     """Compile all four tiers into target/.
 
     Compiles every entity's metrics and wide tables, writing dialect-specific
@@ -220,15 +226,35 @@ def build(models_dir: str) -> None:
     Examples:
       mesa build
       mesa build --models-dir custom_models/
+      mesa build --check      # CI gate: fail if a wide file is stale
 
     Use 'mesa compile <Entity>' to compile just one entity and see the SQL.
     """
     from mesa_core import build as _build
 
     proj = _load(models_dir)
+
+    if check_only:
+        drifted = _build.check_wide_layer(proj, models_dir)
+        if drifted:
+            for name in drifted:
+                click.echo(click.style(
+                    f"DRIFT: models/wide_layer/{name}Wide.sql is out of date.",
+                    fg="red"), err=True)
+            click.echo(click.style(
+                f"WIDE-LAYER DRIFT: {len(drifted)} entity(s) stale. Run 'mesa build' and commit.",
+                fg="red", bold=True), err=True)
+            sys.exit(1)
+        click.echo(click.style("WIDE-LAYER CHECK PASSED — no drift.", fg="green"))
+        return
+
     target_dir = Path(models_dir).resolve().parent / "target"
-    written = _build.build(proj, target_dir=target_dir)
-    click.echo(f"Compiled {proj.name} ({len(proj.entities)} entities) -> {len(written)} files in {target_dir}/.")
+    result = _build.build(proj, target_dir=target_dir)
+
+    for warning in result.type_inference_warnings:
+        click.echo(click.style(warning, fg="yellow"), err=True)
+
+    click.echo(f"Compiled {proj.name} ({len(proj.entities)} entities) -> {len(result.written)} files in {target_dir}/.")
 
 
 @cli.command()
@@ -291,6 +317,9 @@ def compile(entity: str, models_dir: str, warehouse: str, out) -> None:
     metrics = _build.metrics_for_entity(proj, target)
     result = _build.compile_entity(target, metrics, target_warehouse)
 
+    for warning in result.type_inference_warnings:
+        click.echo(click.style(warning, fg="yellow"), err=True)
+
     metric_sql = result.compiled_metric_layer_sql.rstrip() + "\n"
     wide_sql = result.compiled_widetable_sql.rstrip() + "\n"
 
@@ -304,6 +333,59 @@ def compile(entity: str, models_dir: str, warehouse: str, out) -> None:
         click.echo(metric_sql)
         click.echo(f"-- {entity}Wide (Wide Layer)")
         click.echo(wide_sql)
+
+
+@cli.command()
+@click.option("--models-dir", default="models", metavar="DIR", help="Models directory.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the scorecard as JSON.")
+@click.option("--strict", is_flag=True, help="Exit non-zero if any WARN/FAIL line exists.")
+def evaluate(models_dir: str, as_json: bool, strict: bool) -> None:
+    """Grade the project's engineering health (advisory scorecard).
+
+    ``mesa evaluate`` is the mirror, not the gate. It runs the full best-practice
+    suite — structure/DAG, identity/grain, metric governance, enrichment + docs,
+    and a safety roll-up — and prints a graded scorecard per entity + per project.
+
+    \b
+    This is NOT ``mesa validate``. The distinction is the point:
+      - ``mesa validate``  the CI gate — blocking rules only, exits non-zero.
+      - ``mesa evaluate``   the advisory report — grades everything, never
+                           fails a build by default.
+
+    \b
+    Every non-pass line carries a one-sentence "why it matters" + a pointer, so
+    the report teaches, not just scores.
+
+    \b
+    Flags:
+      --json    emit the scorecard as machine-readable JSON (for CI/tooling)
+      --strict  exit non-zero if any WARN/FAIL line exists (opt-in gate)
+
+    \b
+    Examples:
+      mesa evaluate
+      mesa evaluate --json
+      mesa evaluate --strict
+      mesa evaluate --models-dir custom_models/
+    """
+    from mesa_core.evaluate.framework import evaluate as run_evaluate
+    from mesa_core.evaluate.render import render_scorecard
+
+    proj = _load(models_dir)
+    score = run_evaluate(proj)
+
+    if as_json:
+        click.echo(score.to_json())
+    else:
+        click.echo(render_scorecard(score))
+
+    has_nonpass = any(
+        r.status in ("warn", "fail")
+        for es in score.entities for r in es.results
+    ) or any(r.status in ("warn", "fail") for r in score.project_results)
+
+    if strict and has_nonpass:
+        sys.exit(1)
 
 
 @cli.command()

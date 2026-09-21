@@ -140,7 +140,7 @@ def build_schema_yml(entities_with_metrics_and_views: list[dict]) -> str:
             f"      sensitivity: {_yaml_str(sensitivity)}",
             f"    columns:",
             f"      - name: ID",
-            f"        description: {_yaml_str(f'Stable, hashed {entity_snake} identifier (TO_BASE64(SHA256) — base64 STRING). Primary key.')}",
+            f"        description: {_yaml_str(f'Stable, hashed {entity_snake} identifier (canonical SHA256 → base64 STRING). Primary key.')}",
             f"        tests:",
             f"          - unique",
             f"          - not_null",

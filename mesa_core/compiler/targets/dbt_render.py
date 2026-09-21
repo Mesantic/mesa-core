@@ -31,8 +31,12 @@ These builders match the shape in model_zoo_bq/models/mesa/ exactly:
 
 Identity guarantee
 ------------------
-Identity is ALWAYS hashed — TO_BASE64(SHA256(CAST(<col> AS STRING))) for BigQuery;
-BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(<col>), 256)) for Snowflake (SPEC_37 §5).
+Identity is ALWAYS hashed — the canonical formula is SHA256 → base64, expressed
+per dialect (SPEC_70):
+  BigQuery   TO_BASE64(SHA256(CAST(<col> AS STRING)))
+  Snowflake  BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(<col>), 256))
+  DuckDB     base64(from_hex(sha256(CAST(<col> AS VARCHAR))))
+  Redshift   f_mesa_id(CAST(<col> AS VARCHAR))   (governed Python UDF)
 There is NO un-hashed passthrough path.  Guided entities carry a verifier-guaranteed
 hashed ID in definition_sql; the fallback also hashes unconditionally.
 
@@ -101,9 +105,61 @@ def _coalesce_default(definition_sql: str) -> str:
     return "0"
 
 
+# ── Canonical identity expression (SPEC_70) ──────────────────────────────────
+
+def identity_expr(dialect: str, col_expr: str) -> str:
+    """Emit the canonical SHA256 entity-ID expression for a dialect.
+
+    This is the single source of truth for the identity formula.  The canonical
+    algorithm is SHA256.  Three warehouses can produce the base64 form natively;
+    Redshift can only produce the HEX form (SHA2 returns hex; base64-of-binary
+    does not exist and plpythonu UDFs are removed — verified live 2026-09-17):
+      BigQuery   TO_BASE64(SHA256(CAST(... AS STRING)))            (base64)
+      Snowflake  BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(...), 256))  (base64)
+      DuckDB     base64(from_hex(sha256(...)))                    (base64)
+      Redshift   SHA2(CAST(... AS VARCHAR), 256)                  (HEX — native)
+
+    Redshift's hex and the others' base64 are the SAME 32-byte digest, written
+    two ways.  Cross-warehouse joins into/out of Redshift bridge via the hex
+    form — see identity_hex_expr() (the "hex only when needed" bridge).
+
+    ``col_expr`` is the already-cast expression that carries the natural key.
+    """
+    d = (dialect or "bigquery").lower().strip()
+    if d in ("snowflake", "sf"):
+        return f"BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR({col_expr}), 256))"
+    if d in ("redshift", "postgres", "pg", "postgresql"):
+        return f"SHA2(CAST({col_expr} AS VARCHAR), 256)"
+    if d in ("duckdb",):
+        return f"base64(from_hex(sha256(CAST({col_expr} AS VARCHAR))))"
+    # BigQuery default
+    return f"TO_BASE64(SHA256(CAST({col_expr} AS STRING)))"
+
+
+def identity_hex_expr(dialect: str, col_expr: str) -> str:
+    """Emit the HEX form of the canonical SHA256 ID for a non-Redshift dialect.
+
+    This is the "hex only when needed" bridge (SPEC_70 follow-on): when an entity
+    on a base64-native warehouse declares a cross-warehouse relationship INTO or
+    OUT OF Redshift, it carries an extra hex key (IDHex) that matches Redshift's
+    native ``SHA2(...)`` output byte-for-byte, so the join works without adding
+    any Lambda/IAM/cost to the AWS side.  Emitted ONLY for that declared link —
+    never globally.
+    """
+    d = (dialect or "bigquery").lower().strip()
+    if d in ("snowflake", "sf"):
+        # Snowflake SHA2(x, 256) returns hex directly (no base64 wrapper).
+        return f"SHA2(TO_VARCHAR({col_expr}), 256)"
+    if d in ("duckdb",):
+        # DuckDB sha256(x) returns hex VARCHAR directly.
+        return f"sha256(CAST({col_expr} AS VARCHAR))"
+    # BigQuery: TO_HEX(SHA256(...)) returns lowercase hex, matching Redshift SHA2.
+    return f"TO_HEX(SHA256(CAST({col_expr} AS STRING)))"
+
+
 # ── Raw model ─────────────────────────────────────────────────────────────────
 
-def build_raw_model(entity) -> str:
+def build_raw_model(entity, dialect: str = "bigquery") -> str:
     """
     Build the raw-layer SQL body.
 
@@ -114,7 +170,7 @@ def build_raw_model(entity) -> str:
 
     Fallback (entity.definition_sql is None / empty):
       Emit a minimal raw model with:
-        - Hashed ID: TO_BASE64(SHA256(CAST(<identity_column> AS STRING))) AS ID
+        - Hashed ID: the canonical SHA256 → base64 expression for ``dialect``
         - All other columns via * EXCEPT(<identity_column>)
         - _loaded_at audit column
         - {{ source('<source_name>', '<base_table_name>') }} source ref
@@ -134,13 +190,14 @@ def build_raw_model(entity) -> str:
     source_name = entity.source_name
     base_table = entity.base_table_name
     entity_alias = entity.entity_name  # PascalCase alias
+    id_expr = identity_expr(dialect, f"{entity_alias}.{identity_col}")
 
     lines = [
         f"-- MESA Raw Layer: {entity.entity_name} (auto-generated fallback)",
-        f"-- Identity is always hashed — TO_BASE64(SHA256(CAST(<key> AS STRING)))",
+        f"-- Identity is always hashed — canonical SHA256 → base64 ({dialect})",
         f"",
         f"SELECT",
-        f"  TO_BASE64(SHA256(CAST({entity_alias}.{identity_col} AS STRING))) AS ID",
+        f"  {id_expr} AS ID",
         f"  , * EXCEPT ({identity_col})",
         f"  , CURRENT_TIMESTAMP() AS _loaded_at",
         f"FROM {{{{ source('{source_name}', '{base_table}') }}}} AS {entity_alias}",

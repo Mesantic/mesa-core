@@ -60,7 +60,7 @@ def test_new_entity_from_columns(tmp_path, runner):
     assert raw_file.exists()
     body = raw_file.read_text()
     assert "-- RAW ENTITY: Policy" in body
-    assert "BASE64_ENCODE(SHA2(" in body  # hashed ID line
+    assert "BASE64_ENCODE(SHA2_BINARY(" in body  # canonical SHA256 → base64 ID line
     assert "AS ID" in body
     for col in ("policy_id", "policy_name", "inception_date", "zip_code", "status"):
         assert col in body  # raw source column present
@@ -207,7 +207,15 @@ def test_compile_single_entity(tmp_path, runner):
     assert "NumberOfOrders" in result.output
 
 
-def test_learn_stub(tmp_path, runner):
-    result = runner.invoke(cli, ["learn"])
-    assert result.exit_code == 0
-    assert "SPEC_67" in result.output
+def test_learn_stub(tmp_path, runner, monkeypatch):
+    # `mesa learn` tracks progress + a working DuckDB copy under
+    # Path.cwd()/.mesa_learn — isolate cwd so this test never reads/writes
+    # the real repo's scratch state (and never leaves any behind).
+    monkeypatch.chdir(tmp_path)
+    # Each lesson pauses on `ctx.pause()` (an Enter-to-continue prompt) —
+    # feed enough blank lines to walk through the whole tutorial non-interactively.
+    result = runner.invoke(cli, ["learn"], input="\n" * 20)
+    assert result.exit_code == 0, result.output
+    assert "WELCOME TO MESA LEARN" in result.output
+    assert "LESSON 1" in result.output
+    assert "completed all 5 lessons" in result.output

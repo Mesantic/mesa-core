@@ -9,8 +9,11 @@ defining SQL conforms to the MESA raw-layer contract.
 
 The contract protects **identity + grain integrity**, NOT source count:
 
-  - Identity MUST be a hashed surrogate (TO_BASE64(SHA256(...)), MD5(...), ...).
-    A bare source key (e.g. ``p.part_id AS ID``) is NEVER a valid MESA identity.
+  - Identity MUST be a canonical hashed surrogate — SHA256 → base64
+    (TO_BASE64(SHA256(...)), BASE64_ENCODE(SHA2_BINARY(...,256)), f_mesa_id(...),
+    base64(from_hex(sha256(...)))). A bare source key (e.g. ``p.part_id AS ID``)
+    is NEVER a valid MESA identity, and a non-canonical hash (MD5/SHA1) is
+    rejected because it breaks cross-warehouse ID joins (SPEC_70).
   - NO cross-row AGGREGATION in the raw layer (SUM/AVG/COUNT/... over groups
     produce metrics -> Metric layer). BUT row-level transforms are LEGAL and
     expected: SAFE_CAST, IF(flag,1,0), CASE, COALESCE, window functions
@@ -48,6 +51,7 @@ Severity = Literal["block", "warn", "info"]
 # finding -- source count is not a rule.
 CODE_ID_UNHASHED = "MESA_RAW_ID_UNHASHED"        # identity is not a hashed surrogate
 CODE_ID_PASSTHROUGH = "MESA_RAW_ID_PASSTHROUGH"  # identity aliased from a bare source key
+CODE_ID_NON_CANONICAL = "MESA_RAW_ID_NON_CANONICAL"  # identity uses a non-canonical hash (MD5/SHA1)
 CODE_HAS_AGGREGATE = "MESA_RAW_HAS_AGGREGATE"    # cross-row aggregation produces a metric
 CODE_GRAIN_RISK = "MESA_RAW_GRAIN_RISK"          # a JOIN may change the grain (warn)
 CODE_BRONZE_NUDGE = "MESA_RAW_BRONZE_NUDGE"      # sourced from a bronze/gold layer (info)
@@ -133,8 +137,47 @@ _BRONZE_NAME_FRAGMENTS = ("bronze", "silver", "gold", "_stg_", "staging", "_cura
 _HASH_FUNC_PATTERN = (
     r"(?:to_base64\s*\(\s*sha256"      # BigQuery: TO_BASE64(SHA256(...))
     r"|base64_encode\s*\(\s*sha2"      # Snowflake: BASE64_ENCODE(SHA2(...))
+    r"|f_mesa_id\s*\("                 # Redshift: governed SHA256 → base64 UDF
+    r"|base64\s*\(\s*from_hex\s*\(\s*sha256"  # DuckDB: base64(from_hex(sha256(...)))
     r"|sha2|sha256|md5|sha1|crc32|farm_fingerprint)"
 )
+
+# Non-canonical identity hash functions (SPEC_70). MD5 and SHA1 are weaker and
+# non-portable — the canonical formula is SHA256 → base64. Redshift's governed
+# f_mesa_id() UDF wraps SHA256 → base64 and is canonical; DuckDB's
+# base64(from_hex(sha256(...))) is canonical.
+_NON_CANONICAL_HASH_PATTERN = (
+    r"\bmd5\s*\("                     # MD5( — non-canonical, weaker
+    r"|\bsha1\s*\("                   # SHA1( — non-canonical, weaker
+    r"|\bcrc32\s*\("                  # CRC32( — non-canonical, weaker
+    r"|farm_fingerprint\s*\("         # Farm fingerprint — non-canonical
+)
+
+
+def _find_non_canonical_hash(sql: str, identity_column: str) -> str | None:
+    """Return the offending non-canonical hash function name if the identity
+    column is produced by one (e.g. ``md5``). Only fires when the hash is the
+    one wrapping the identity column — a stray MD5 elsewhere in the body is not
+    an identity concern."""
+    col_pattern = re.escape(identity_column)
+    # A non-canonical hash call whose result is aliased to the identity column.
+    alias_pattern = (
+        rf"(?i){_NON_CANONICAL_HASH_PATTERN}.*?"
+        rf"(?:\s+as\s+{col_pattern}\b|\b{col_pattern}\s*(?:,|\)|$))"
+    )
+    m = re.search(alias_pattern, sql, re.DOTALL)
+    if not m:
+        return None
+    # Extract the function name (first group that matched).
+    for g in m.groups():
+        if g:
+            return g.lower()
+    # Fallback: scan the leading capture for a keyword.
+    head = m.group(0).lower()
+    for fn in ("md5", "sha1", "crc32", "farm_fingerprint"):
+        if fn in head:
+            return fn
+    return "non-canonical"
 
 
 # -- Identity checks ----------------------------------------------------------
@@ -323,8 +366,35 @@ def verify_raw_contract(sql: str, identity_column: str = "ID") -> VerificationRe
                 f"Identity column '{identity_column}' is not produced by a hash function."
             ),
             suggestion=(
-                "Produce the identity as a hashed surrogate, e.g. "
-                "TO_BASE64(SHA256(...)) (BigQuery) or MD5(...)."
+                "Produce the identity as a canonical SHA256 → base64 hashed surrogate, "
+                "e.g. TO_BASE64(SHA256(...)) (BigQuery) or "
+                "BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(...), 256)) (Snowflake)."
+            ),
+            corrected_snippet=(
+                f"TO_BASE64(SHA256(CAST(<source_key> AS STRING))) AS {identity_column}"
+            ),
+        ))
+
+    # -- Canonical hash (SPEC_70) ---------------------------------------------
+    # Identity is hashed but with a non-canonical function (MD5/SHA1/CRC32/...).
+    # The canonical formula is SHA256 → base64 so the SAME natural key produces a
+    # byte-identical ID across every warehouse port (BigQuery, Snowflake, DuckDB,
+    # Redshift via f_mesa_id). MD5 is weaker AND non-portable, so it is rejected.
+    non_canonical_fn = _find_non_canonical_hash(sql, identity_column)
+    if non_canonical_fn:
+        findings.append(Finding(
+            code=CODE_ID_NON_CANONICAL,
+            severity="block",
+            message=(
+                f"Identity column '{identity_column}' is produced by "
+                f"{non_canonical_fn.upper()}(), which is not the canonical "
+                f"SHA256 → base64 formula."
+            ),
+            suggestion=(
+                "Use the canonical SHA256 → base64 identity so the same entity hashes "
+                "identically across warehouses: TO_BASE64(SHA256(...)) (BigQuery), "
+                "BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(...), 256)) (Snowflake), "
+                "base64(from_hex(sha256(...))) (DuckDB), or f_mesa_id(...) (Redshift)."
             ),
             corrected_snippet=(
                 f"TO_BASE64(SHA256(CAST(<source_key> AS STRING))) AS {identity_column}"

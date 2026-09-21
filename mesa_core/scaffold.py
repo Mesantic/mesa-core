@@ -112,13 +112,15 @@ def _raw_sql_stub(entity_name: str, columns: list[str]) -> str:
     return (
         f"-- RAW ENTITY: {entity_name}\n"
         f"-- Grain: one row per {entity_name.lower()} <-- FILL IN the exact grain>\n"
-        f"-- ID: hashed primary key — BASE64_ENCODE(SHA2(<FILL IN natural key>, 256))\n"
-        f"-- Doctrine: 1:1 enrichment at top level; 1:many detail as typed ARRAYs;\n"
+        f"-- ID: hashed primary key — BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(<FILL IN natural key>), 256))\n"
+        f"-- Doctrine: canonical SHA256 → base64 identity (SPEC_70) — same key hashes\n"
+        f"--           identically across BigQuery / Snowflake / DuckDB / Redshift.\n"
+        f"--           1:1 enrichment at top level; 1:many detail as typed ARRAYs;\n"
         f"--           system IDs in typed system-specific OBJECTs, never bare.\n"
         f"--           THIS ENTITY IS THE CONTRACT.\n"
         f"\n"
         f"SELECT\n"
-        f"    BASE64_ENCODE(SHA2(<FILL IN natural key>, 256)) AS ID\n"
+        f"    BASE64_ENCODE(SHA2_BINARY(TO_VARCHAR(<FILL IN natural key>), 256)) AS ID\n"
         f"{alias_lines}"
         f"FROM {{{{ source('<source>', '<table>') }}}} AS Source\n"
     )

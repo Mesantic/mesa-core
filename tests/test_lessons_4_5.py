@@ -38,8 +38,12 @@ def test_lesson4_bigquery_vs_snowflake_differ():
     # BigQuery uses simple column names
     assert "  Customer\n" in result_bq.stdout, "BigQuery should use simple column name"
     
-    # Snowflake uses as_struct macro
-    assert "as_struct" in result_sf.stdout, "Snowflake should use as_struct macro"
+    # Snowflake uses the two-OBJECT combiner form (SPEC_72), not the retired
+    # as_struct macro.
+    assert "OBJECT_CONSTRUCT(" in result_sf.stdout, \
+        "Snowflake should use the OBJECT_CONSTRUCT combiner form"
+    assert "as_struct" not in result_sf.stdout, \
+        "Snowflake must not use the retired as_struct macro"
     
     # Outputs must differ
     assert result_bq.stdout != result_sf.stdout

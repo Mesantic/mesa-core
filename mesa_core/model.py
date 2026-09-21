@@ -19,7 +19,7 @@ HARD RULE: no sqlalchemy, no pydantic, no fastapi, no api.* imports here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -35,12 +35,20 @@ class Entity:
     entity_name: str
     base_table_name: str
     source_name: str
-    warehouse: str  # "Snowflake" | "BigQuery" | "Redshift" | "Synapse" | "DuckDB"
+    warehouse: str  # "Snowflake" | "BigQuery" | "Redshift" | "Synapse" | "DuckDB" | "AzureSQLDatabase"
     identity_column: str = "ID"
     definition_sql: str = ""
     grain_description: str | None = None
     grain_columns: tuple[str, ...] | None = None  # tuple, not list — frozen-hashable
     uniqueness: str | None = None  # "enforced" | "advisory" | None
+    # SPEC_71 evaluate: identity test coverage declared in the raw sidecar
+    # (_raw.yml) — the empirical backstop to grain_guard. None = no sidecar.
+    identity_tests: tuple[str, ...] | None = None
+    identity_description: str | None = None  # doc-completeness signal
+    # SPEC_72: per-entity wide-layer JOIN type (INNER vs LEFT). Default LEFT
+    # (the safer default — never silently drops a row that lacks one metric).
+    # Entity-config-driven: read from the entity's yml sidecar, not hardcoded.
+    wide_join_type: str = "LEFT"
 
 
 @dataclass(frozen=True)
@@ -50,6 +58,11 @@ class Metric:
     metric_name: str
     entity_name: str
     definition_sql: str
+    # SPEC_71 evaluate: metric governance + doc-completeness metadata parsed
+    # from the ``-- Owner:`` / ``-- Contract:`` doctrine header.
+    owner: str | None = None
+    contract: str | None = None
+    description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,3 +84,12 @@ class CompileResult:
     metric_count: int
     compiled_metric_layer_sql: str
     compiled_widetable_sql: str
+    # SPEC_72 (combiner architecture): the per-entity metric COMBINER model
+    # (Snowflake only) — "" for every other warehouse, since only Snowflake's
+    # wide render needs a separate flat-columned combiner model to join
+    # against. Written to models/metric_layer/<entity_snake>_metrics.sql.
+    compiled_combiner_sql: str = ""
+    # SPEC_72 Slice 4: metrics whose wide-layer type was inferred (no explicit
+    # ``-- WIDE_TYPE:`` annotation). A caller (Mesantic) surfaces these; the
+    # CLI prints them to stderr. Never silently cast to VARCHAR without notice.
+    type_inference_warnings: list[str] = field(default_factory=list)

@@ -61,6 +61,11 @@ _GRAIN_RE = re.compile(r"^\s*--\s*Grain\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _ID_RE = re.compile(r"^\s*--\s*ID\s*:\s*(.+?)\s*$", re.IGNORECASE)
 _NATURAL_KEY_RE = re.compile(r"^\s*--\s*Natural key\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
+# Metric-layer doctrine header lines (SPEC_71 Group 3 / Group 4).
+_OWNER_RE = re.compile(r"^\s*--\s*Owner\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_CONTRACT_RE = re.compile(r"^\s*--\s*Contract\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_METRIC_DESC_RE = re.compile(r"^\s*--\s*METRIC\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
 DEFAULT_WAREHOUSE = "Snowflake"
 
 
@@ -162,6 +167,75 @@ def _parse_doctrine_header(sql: str) -> dict:
     return meta
 
 
+def _parse_metric_header(sql: str) -> dict:
+    """Extract metric-layer doctrine header metadata (owner / contract /
+    description) as a dict. Missing keys are absent, not errors.
+
+    The header lines live ABOVE the SQL body in the authored file, so this
+    reads the FULL file text (config block + comment header included) — the
+    caller passes the raw file text, not the stripped body.
+
+    ``description`` is the prose comment line(s) between the ``-- METRIC:``
+    line and the ``-- Owner:`` line — the free-text "what this metric means".
+    """
+    meta: dict = {}
+    prose: list[str] = []
+    for line in sql.splitlines():
+        m = _OWNER_RE.match(line)
+        if m:
+            meta.setdefault("owner", m.group(1).strip())
+            continue
+        m = _CONTRACT_RE.match(line)
+        if m:
+            meta.setdefault("contract", m.group(1).strip())
+            continue
+        m = _METRIC_DESC_RE.match(line)
+        if m:
+            meta.setdefault("description", m.group(1).strip())
+            continue
+        # A prose comment line: `-- text` that is not one of the known keys.
+        stripped = line.strip()
+        if stripped.startswith("--") and not stripped.startswith("-- "):
+            # skip decorative separators like "----"
+            continue
+        if stripped.startswith("-- "):
+            text = stripped[3:].strip()
+            if text and not _RAW_ENTITY_RE.match(stripped):
+                prose.append(text)
+    # Only treat prose as a description if a -- METRIC: line was present (so
+    # the header is a metric doctrine header, not a raw entity's).
+    if "description" in meta and prose:
+        meta["description"] = " ".join(prose)
+    return meta
+
+
+def _parse_raw_identity_tests(yml_path: Path, entity_name: str) -> tuple[tuple[str, ...] | None, str | None]:
+    """Read the raw sidecar (``_raw.yml``) and return the identity column's
+    declared tests + description for the model ``<Entity>Raw``.
+
+    Returns ``(tests_tuple, description)`` where ``tests_tuple`` is None when
+    the sidecar is missing/unparseable, the model isn't declared, or the ID
+    column has no tests declared.
+    """
+    if not yml_path.exists() or not _YAML_AVAILABLE:
+        return None, None
+    try:
+        doc = yaml.safe_load(yml_path.read_text()) or {}
+    except Exception:
+        return None, None
+    model_name = f"{entity_name}Raw"
+    for model in doc.get("models", []) or []:
+        if (model.get("name") or "") != model_name:
+            continue
+        for col in model.get("columns", []) or []:
+            if (col.get("name") or "").upper() == "ID":
+                tests = col.get("tests") or []
+                tests_tuple = tuple(t for t in tests if isinstance(t, str))
+                desc = col.get("description")
+                return tests_tuple, (desc if isinstance(desc, str) else None)
+    return None, None
+
+
 def _first_source_ref(sql: str) -> tuple[str, str]:
     """Return (source_name, base_table_name) from the first ``source()`` ref,
     or ("", "") if none. Deterministic; Slice 3/6 may refine the spine choice."""
@@ -169,6 +243,33 @@ def _first_source_ref(sql: str) -> tuple[str, str]:
     if m:
         return m.group(1), m.group(2)
     return "", ""
+
+
+def _parse_wide_join_type(wide_yml_path: Path, entity_name: str) -> str:
+    """Read the wide-layer sidecar (``_wide.yml``) and return the entity's
+    declared wide-layer JOIN type (INNER vs LEFT).
+
+    The join type is entity config, so it lives as a structured
+    ``meta.wide_join_type`` key on the ``<Entity>Wide`` model (SPEC_72 Slice 2).
+    Returns the default LEFT when the sidecar is missing/unparseable, the model
+    isn't declared, or no ``wide_join_type`` key exists — never silently drops a
+    row that lacks one metric.
+    """
+    if not wide_yml_path.exists() or not _YAML_AVAILABLE:
+        return "LEFT"
+    try:
+        doc = yaml.safe_load(wide_yml_path.read_text()) or {}
+    except Exception:
+        return "LEFT"
+    model_name = f"{entity_name}Wide"
+    for model in doc.get("models", []) or []:
+        if (model.get("name") or "") != model_name:
+            continue
+        meta = model.get("meta") or {}
+        jt = meta.get("wide_join_type")
+        if isinstance(jt, str) and jt.strip().upper() in ("INNER", "LEFT"):
+            return jt.strip().upper()
+    return "LEFT"
 
 
 # ── Layer loaders ────────────────────────────────────────────────────────────
@@ -199,6 +300,9 @@ def _load_entities(models_dir: Path, warehouse: str, errors: list[str]) -> list[
         header = _parse_doctrine_header(sql)
         source_name, base_table_name = _first_source_ref(sql)
 
+        identity_tests, identity_description = _parse_raw_identity_tests(raw_dir / "_raw.yml", entity_name)
+        wide_join_type = _parse_wide_join_type(models_dir / "wide_layer" / "_wide.yml", entity_name)
+
         entities.append(Entity(
             entity_name=entity_name,
             base_table_name=base_table_name,
@@ -209,6 +313,9 @@ def _load_entities(models_dir: Path, warehouse: str, errors: list[str]) -> list[
             grain_description=header.get("grain"),
             grain_columns=None,
             uniqueness=None,
+            identity_tests=identity_tests,
+            identity_description=identity_description,
+            wide_join_type=wide_join_type,
         ))
     return entities
 
@@ -235,6 +342,7 @@ def _load_metrics(models_dir: Path, errors: list[str]) -> list[Metric]:
                 errors.append(f"cannot read {sql_file}: {exc}")
                 continue
             metric_name = sql_file.stem
+            header = _parse_metric_header(sql)
             body = _strip_config_and_header(sql)
             if not body.strip():
                 errors.append(f"{sql_file}: empty SQL body after stripping config/header")
@@ -243,6 +351,9 @@ def _load_metrics(models_dir: Path, errors: list[str]) -> list[Metric]:
                 metric_name=metric_name,
                 entity_name=entity_name,
                 definition_sql=body,
+                owner=header.get("owner"),
+                contract=header.get("contract"),
+                description=header.get("description"),
             ))
     return metrics
 

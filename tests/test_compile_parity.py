@@ -149,8 +149,16 @@ def test_compile_entity_parity_snowflake():
 
     gov_result = _gov_compile_entity(entity_dict, metric_dicts, "Snowflake")
 
+    # Metric layer parity is unchanged (SPEC_66).
     assert mesa_result.compiled_metric_layer_sql == gov_result["metric_layer"]
-    assert mesa_result.compiled_widetable_sql == gov_result["widetable"]
+
+    # Wide layer: SPEC_72 deliberately replaces the governance compiler's
+    # retired ``as_struct`` Snowflake form with CAO's decided two-OBJECT
+    # combiner form. The two are no longer byte-identical by design — assert
+    # the new form is what mesa-core emits (and that the stale macro is gone).
+    assert "OBJECT_CONSTRUCT(" in mesa_result.compiled_widetable_sql
+    assert "as_struct" not in mesa_result.compiled_widetable_sql
+    assert "as_struct" in gov_result["widetable"]  # the legacy form is still there until the governance port
 
 
 def test_compile_from_expression_parity():

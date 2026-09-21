@@ -45,26 +45,25 @@ RAW LAYER (Tier 1)        →  METRIC LAYER (Tier 2)  →  WIDE LAYER (Tier 3)  
 | `mesa build` | compile all layers to `target/` |
 | `mesa compile <entity>` | compile one entity's metric + wide layers |
 | `mesa validate` | run the validation brain; non-zero exit on any violation — the "refuse bad code" gate |
+| `mesa evaluate` | the advisory health scorecard — grades every entity, never fails a build by default (`--strict` to gate, `--json` for CI) |
 | `mesa fmt` | run the MESA formatter, rewriting files |
 | `mesa lint` | formatter check-mode (CI gate, non-zero exit on violation) |
 | `mesa learn` | the guided tutorial (coming soon) |
 
 ## Cross-warehouse portability
 
-One definition compiles to every warehouse. No dialect is paywalled — the
-portability is the point:
+One definition compiles to every supported warehouse:
 
 - **Snowflake** — `OBJECT_CONSTRUCT_KEEP_NULL`, colon field access, `::OBJECT` casts
 - **BigQuery** — `STRUCT`, `UNNEST`, `SAFE_CAST`
 - **Redshift** — `dbt_utils.star()`
 - **DuckDB** — local development with zero external warehouse
 
-## The validation brain is free
+## Validation
 
-The compiler is not the moat — the *refusal of bad definitions* is. `mesa
-validate` runs `grain_guard`, `core_rules`, and `mesa_verifier` locally, catching
-the fat-finger-join class of bug (identity collisions, grain fan-out, `SELECT *`,
-raw warehouse paths) before bad SQL ever reaches a warehouse.
+`mesa validate` runs `grain_guard`, `core_rules`, and `mesa_verifier` locally,
+catching the fat-finger-join class of bug (identity collisions, grain fan-out,
+`SELECT *`, raw warehouse paths) before bad SQL ever reaches a warehouse.
 
 ## Quickstart
 
@@ -76,13 +75,20 @@ cd quickstart
 mesa build        # compile all four tiers to target/
 ```
 
+## The MESA Rulebook
+
+Every rule `mesa evaluate` grades against — the four tiers, hashed identity,
+grain, link STRUCTs, metric governance, enrichment, documentation, and the
+safety rules — is documented in **[`docs/RULEBOOK.md`](docs/RULEBOOK.md)**. The
+scorecard's `-> see:` lines point into it, so a "read the MESA Rulebook —
+'Enrichment'" pointer lands you in the right place.
+
 ## Why it matters
 
-Every other semantic layer starts at *meaning* and assumes *identity* was
-already solved by whatever table happens to have an ID column. MESA governs both
-halves — identity in the Raw Layer, interpretation in the Metric Layer — as two
-separate, separately-owned concerns. MESA Core is the free, forkable, standard
-syntax for that discipline.
+Most semantic layers start at *meaning* and assume *identity* was already
+solved by whatever table happens to have an ID column. MESA governs both
+halves — identity in the Raw Layer, interpretation in the Metric Layer — as
+two separate, separately-owned concerns.
 
 ## License
 

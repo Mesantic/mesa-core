@@ -676,7 +676,7 @@ class MesaDbtEmitter:
         artifacts: list[Artifact] = []
 
         # ── 1. Raw-layer model ────────────────────────────────────────────
-        raw_sql = build_raw_model(entity)
+        raw_sql = build_raw_model(entity, dialect=self._dialect)
         artifacts.append(Artifact(
             kind="file",
             object_type="dbt_raw",

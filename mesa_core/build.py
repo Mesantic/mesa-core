@@ -79,15 +79,24 @@ def compile_entity(entity: Entity, metrics: list[Metric], warehouse: str):
 
 # ── Build ────────────────────────────────────────────────────────────────────
 
-def build(project: Project, target_dir: str | Path = "target") -> list[Path]:
+@dataclass
+class BuildResult:
+    """Result of ``build()`` — files written plus any SPEC_72 type-inference
+    warnings collected while assembling the Snowflake wide layer."""
+    written: list[Path] = field(default_factory=list)
+    type_inference_warnings: list[str] = field(default_factory=list)
+
+
+def build(project: Project, target_dir: str | Path = "target") -> BuildResult:
     """Compile every entity and write the four tiers to target/.
 
     ``target_dir`` is resolved by the caller (the CLI passes an absolute path
-    rooted at the project directory). Returns the list of files written
-    (deterministic order).
+    rooted at the project directory). Returns the files written + any
+    type-inference warnings (deterministic order).
     """
     target = Path(target_dir)
     written: list[Path] = []
+    warnings: list[str] = []
 
     # Raw layer — verbatim authored SQL.
     raw_dir = target / "raw_layer"
@@ -107,9 +116,21 @@ def build(project: Project, target_dir: str | Path = "target") -> list[Path]:
         _write_generated(mpath, result.compiled_metric_layer_sql)
         written.append(mpath)
 
+        # SPEC_72 (combiner architecture): Snowflake's wide render joins
+        # against a separate per-entity combiner model instead of the
+        # individual metric files — write it alongside the wide table.
+        if result.compiled_combiner_sql:
+            from mesa_core.compiler.combiner import combiner_model_name
+
+            cpath = metric_dir / f"{combiner_model_name(entity.entity_name)}.sql"
+            _write_generated(cpath, result.compiled_combiner_sql)
+            written.append(cpath)
+
         wpath = wide_dir / f"{entity.entity_name}Wide.sql"
         _write_generated(wpath, result.compiled_widetable_sql)
         written.append(wpath)
+
+        warnings.extend(result.type_inference_warnings)
 
     # View layer — verbatim authored SQL.
     view_dir = target / "view_layer"
@@ -118,7 +139,51 @@ def build(project: Project, target_dir: str | Path = "target") -> list[Path]:
         _write_generated(path, view.definition_sql or "")
         written.append(path)
 
-    return written
+    return BuildResult(written=written, type_inference_warnings=warnings)
+
+
+def check_wide_layer(project: Project, models_dir: str | Path) -> list[str]:
+    """SPEC_72 Slice 5 — ``--check`` drift mode.
+
+    Regenerate each entity's wide-layer SQL (and, for Snowflake, its
+    combiner model — SPEC_72 combiner architecture) in memory and diff
+    against the on-disk committed files. Returns the list of drifted entity
+    names (empty = up to date). This is the CI gate that catches "added a
+    metric file, forgot to regenerate the wide model."
+    """
+    from mesa_core.compiler.combiner import combiner_model_name
+
+    drifted: list[str] = []
+    models = Path(models_dir)
+    wide_dir = models / "wide_layer"
+    metric_dir = models / "metric_layer"
+
+    for entity in project.entities:
+        metrics = metrics_for_entity(project, entity)
+        result = compile_entity(entity, metrics, entity.warehouse)
+
+        on_disk = wide_dir / f"{entity.entity_name}Wide.sql"
+        if not on_disk.exists():
+            drifted.append(entity.entity_name)
+            continue
+
+        committed = on_disk.read_text()
+        # Compare the raw compiled SQL (without the generated banner, which is
+        # only stamped into target/ writes, never into authored models/ files).
+        if committed.strip() != result.compiled_widetable_sql.strip():
+            drifted.append(entity.entity_name)
+            continue
+
+        if result.compiled_combiner_sql:
+            combiner_on_disk = metric_dir / f"{combiner_model_name(entity.entity_name)}.sql"
+            if not combiner_on_disk.exists():
+                drifted.append(entity.entity_name)
+                continue
+            committed_combiner = combiner_on_disk.read_text()
+            if committed_combiner.strip() != result.compiled_combiner_sql.strip():
+                drifted.append(entity.entity_name)
+
+    return drifted
 
 
 # ── Validate ─────────────────────────────────────────────────────────────────
