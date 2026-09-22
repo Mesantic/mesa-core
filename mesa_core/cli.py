@@ -260,7 +260,7 @@ def build(models_dir: str, check_only: bool) -> None:
 @cli.command()
 @click.argument("entity")
 @click.option("--models-dir", default="models", metavar="DIR", help="Models directory.")
-@click.option("--warehouse", default=None, metavar="WAREHOUSE", help="Override target warehouse (Snowflake, BigQuery, Redshift, DuckDB).")
+@click.option("--warehouse", default=None, metavar="WAREHOUSE", help="Override target warehouse (Snowflake, BigQuery, Redshift, DuckDB, Synapse, AzureSQLDatabase).")
 @click.option("--out", default=None, metavar="PATH", help="Write output to a file instead of stdout.")
 def compile(entity: str, models_dir: str, warehouse: str, out) -> None:
     """Compile one entity's metric + wide layers.
@@ -309,6 +309,10 @@ def compile(entity: str, models_dir: str, warehouse: str, out) -> None:
             target_warehouse = "Redshift"
         elif wh_lower == "duckdb":
             target_warehouse = "DuckDB"
+        elif wh_lower in ("synapse", "azuresynapse"):
+            target_warehouse = "Synapse"
+        elif wh_lower in ("azuresqldb", "azuresqldatabase", "azure_sql_db", "azuresql"):
+            target_warehouse = "AzureSQLDatabase"
         else:
             target_warehouse = warehouse  # pass through as-is
     else:
