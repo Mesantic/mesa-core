@@ -164,6 +164,104 @@ def test_combiner_sql_empty_entity_has_no_joins():
     assert "JOIN" not in body
 
 
+def test_typed_object_raw_column_uses_explicit_object_construct():
+    """Verified 2026-09-23 against real Farmers PolicyRaw: Snowflake's
+    OBJECT_CONSTRUCT(alias.*) wildcard cannot expand a raw column that is
+    itself a typed OBJECT(...)/ARRAY(OBJECT(...)) — raises "Function
+    OBJECT_CONSTRUCT(*) does not support OBJECT(...) argument type". When the
+    raw entity's own definition_sql has such a column, the wide render must
+    switch the RAW side to the explicit key/value form with ::VARIANT casts
+    on the typed columns — the combiner side is unaffected."""
+    entity = Entity(
+        entity_name="Policy",
+        base_table_name="Policy",
+        source_name="rten",
+        warehouse="Snowflake",
+        identity_column="ID",
+        wide_join_type="INNER",
+        definition_sql=(
+            "SELECT\n"
+            "    BASE64_ENCODE(SHA2(Policy.PLCY_CNTRCT_NUM, 256)) AS ID\n"
+            "    , Policy.BUS_ENTITY AS BusinessEntity\n"
+            "    , OBJECT_CONSTRUCT_KEEP_NULL(\n"
+            "        'RtenPlcyCntrctNum', CAST(Policy.PLCY_CNTRCT_NUM AS VARCHAR)\n"
+            "    )::OBJECT(\n"
+            "        RtenPlcyCntrctNum VARCHAR\n"
+            "    ) AS SystemIds\n"
+            "    , COALESCE(\n"
+            "        PolicyMonthlyHistory.MonthlySnapshots::ARRAY (OBJECT(\n"
+            "            LoadYearMonthNum NUMBER\n"
+            "        ))\n"
+            "        , ARRAY_CONSTRUCT()::ARRAY (OBJECT(\n"
+            "            LoadYearMonthNum NUMBER\n"
+            "        ))\n"
+            "    ) AS MonthlySnapshots\n"
+            "FROM {{ source('rten', 'rten_xcmpy_pif_tbl') }} AS Policy\n"
+            "LEFT JOIN PolicyMonthlyHistory\n"
+            "    ON Policy.PLCY_CNTRCT_NUM = PolicyMonthlyHistory.PLCY_CNTRCT_NUM\n"
+        ),
+    )
+    metrics = [
+        Metric(
+            metric_name="InForce90Flag",
+            entity_name="Policy",
+            definition_sql="SELECT Policy.ID, IFF(x, 1, 0) AS InForce90Flag FROM {{ ref('PolicyRaw') }} AS Policy",
+        ),
+    ]
+    result = compile_entity(entity, metrics, "Snowflake")
+    sql = result.compiled_widetable_sql
+
+    # RAW side: explicit key/value form, typed columns cast to ::VARIANT.
+    assert "OBJECT_CONSTRUCT(Policy.*) AS Policy" not in sql
+    assert "'ID', Policy.ID" in sql
+    assert "'BusinessEntity', Policy.BusinessEntity" in sql
+    assert "'SystemIds', Policy.SystemIds::VARIANT" in sql
+    assert "'MonthlySnapshots', Policy.MonthlySnapshots::VARIANT" in sql
+
+    # COMBINER side: unchanged wildcard form.
+    assert "OBJECT_CONSTRUCT(PolicyMetrics.*) AS PolicyMetrics" in sql
+    assert "INNER JOIN {{ ref('policy_metrics') }} AS PolicyMetrics" in sql
+
+
+def test_untyped_raw_columns_keep_wildcard_form():
+    """A raw entity with only flat/scalar columns must keep emitting the
+    zero-maintenance wildcard — this is the 100%-backward-compatible path
+    every existing entity (ChangeEvent, Contact, ...) relies on."""
+    entity = Entity(
+        entity_name="Contact",
+        base_table_name="Contact",
+        source_name="rten",
+        warehouse="Snowflake",
+        identity_column="ID",
+        definition_sql=(
+            "SELECT\n"
+            "    Contact.ID AS ID\n"
+            "    , Contact.Name AS Name\n"
+            "FROM {{ source('rten', 'contact') }} AS Contact\n"
+        ),
+    )
+    result = compile_entity(entity, [], "Snowflake")
+    sql = result.compiled_widetable_sql
+    assert "OBJECT_CONSTRUCT(Contact.*) AS Contact" in sql
+
+
+def test_unparseable_raw_sql_falls_back_to_wildcard():
+    """If the raw entity's definition_sql can't be confidently parsed (e.g.
+    empty, or no depth-0 SELECT/FROM pair), never guess — fall back to the
+    previously-working wildcard form."""
+    entity = Entity(
+        entity_name="Contact",
+        base_table_name="Contact",
+        source_name="rten",
+        warehouse="Snowflake",
+        identity_column="ID",
+        definition_sql="",
+    )
+    result = compile_entity(entity, [], "Snowflake")
+    sql = result.compiled_widetable_sql
+    assert "OBJECT_CONSTRUCT(Contact.*) AS Contact" in sql
+
+
 def test_bigquery_and_redshift_have_no_combiner():
     """The combiner model is Snowflake-only — every other dialect's wide
     render works directly against the entity's existing combined metric
