@@ -63,6 +63,7 @@ Detection strategy
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 
@@ -72,6 +73,8 @@ try:
     _SQLGLOT_AVAILABLE = True
 except ImportError:  # pragma: no cover — sqlglot is a pinned dependency
     _SQLGLOT_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 CODE_FANOUT_BLOCKED = "MESA_GRAIN_FANOUT_BLOCKED"
@@ -95,6 +98,7 @@ _WAREHOUSE_TO_SQLGLOT_DIALECT = {
     "snowflake": "snowflake",
     "redshift": "redshift",
     "duckdb": "duckdb",
+    "azuresqldb": "tsql",
 }
 
 # Dialects to try, in order, when no warehouse hint is given (backfill /
@@ -372,14 +376,15 @@ def _extract_join_targets(sql: str, warehouse: str | None = None) -> tuple[list[
             tried.add(hinted)
             try:
                 return _extract_join_targets_sqlglot(clean, hinted), True
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("sqlglot join-target extraction failed for hinted dialect, probing others: %s", exc)
         for dialect in _DIALECT_PROBE_ORDER:
             if dialect in tried:
                 continue
             try:
                 return _extract_join_targets_sqlglot(clean, dialect), True
-            except Exception:
+            except Exception as exc:
+                logger.debug("sqlglot join-target extraction failed for dialect %s: %s", dialect, exc)
                 continue
         # Every dialect failed to parse this SQL at all.
         regex_targets = _extract_join_targets_regex(clean)
@@ -466,6 +471,15 @@ def check_fanout_risk(
 
     join_names_lower = {name.lower() for name in join_targets}
 
+    # SPEC_74 Slice 2: normalize on the LAST dot-segment too. ``other_base_table_name``
+    # is often stored schema-qualified (``crm.orders``) while ``_extract_join_targets``
+    # returns bare names (``orders``) or backtick-qualified paths (``proj.ds.customers``).
+    # A raw ``crm.orders not in {orders}`` comparison is never true, so schema-qualified
+    # base tables silently passed the fan-out gate. Match on (a) the full lowercased
+    # form, (b) the bare last-segment, and (c) the entity name (metric SQL references
+    # the entity alias, not the physical table).
+    join_bare_lower = {name.lower().rsplit(".", 1)[-1] for name in join_targets}
+
     has_aggregate = _has_cross_row_aggregate(definition_sql)
     has_dedup = _has_dedup_marker(definition_sql, anchor_key=anchor_identity_column)
     collapsed = has_aggregate or has_dedup
@@ -474,7 +488,14 @@ def check_fanout_risk(
     seen: set[str] = set()  # avoid duplicate findings for the same relationship
     for rel in risky_relationships:
         table_lower = rel.other_base_table_name.lower()
-        if table_lower not in join_names_lower:
+        table_bare = table_lower.rsplit(".", 1)[-1]
+        entity_name_lower = rel.other_entity_name.lower()
+        matches = (
+            table_lower in join_names_lower
+            or table_bare in join_bare_lower
+            or entity_name_lower in join_names_lower
+        )
+        if not matches:
             continue
         if collapsed:
             continue  # aggregated or deduped — grain is safe

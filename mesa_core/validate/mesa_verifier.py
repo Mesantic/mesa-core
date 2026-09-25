@@ -529,3 +529,33 @@ def _to_result(findings: list[Finding], *, hashed: bool) -> VerificationResult:
         reasons=reasons,
         findings=findings,
     )
+
+
+def verify_raw_entity_doctrine(sql: str, identity_column: str = "ID") -> list[dict]:
+    """
+    Raw-entity doctrine verification (SPEC_70 Slice 1 sync of SPEC_66 addendum).
+
+    Returns the raw-contract findings as plain dicts using the mesa-core severity
+    taxonomy (``blocking`` / ``warn`` / ``info``), with one deliberate difference
+    from ``verify_raw_contract``: cross-row aggregation is advisory, not a hard
+    fail. The RAW contract's HARD guarantees are (1) identity-is-hashed and (2)
+    grain-is-not-changed — the latter is grain_guard's job, not a name-match on
+    aggregate functions. A bare name-match false-positives on three legal
+    raw-layer patterns: increment-watermark ``MAX(...)`` reads, campaign-grain
+    ``COUNT(DISTINCT x)`` attributes (one row per campaign), and ``ARRAY_AGG``
+    nesting. So ``MESA_RAW_HAS_AGGREGATE`` is downgraded to ``warn`` here
+    (SPEC_66 addendum Bug 2c: warn-not-block), while identity violations stay
+    ``blocking``.
+    """
+    result = verify_raw_contract(sql, identity_column=identity_column)
+    out: list[dict] = []
+    for f in result.findings:
+        d = f.to_dict()
+        # Map the verifier's "block" severity to mesa-core's "blocking" taxonomy.
+        if d.get("severity") == "block":
+            d["severity"] = "blocking"
+        # Downgrade the aggregate finding: advisory, not a hard fail (addendum Bug 2c).
+        if d.get("code") == CODE_HAS_AGGREGATE:
+            d["severity"] = "warn"
+        out.append(d)
+    return out

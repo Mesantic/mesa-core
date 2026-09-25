@@ -201,6 +201,59 @@ CORE_RULES: dict[str, dict] = {
         "bypassed_by_guided_authoring": False,
         "severity": "blocking",
     },
+
+    "MESA-CORE-007": {
+        "name": "No dynamic SQL / identifier construction",
+        "description": (
+            "Metric/raw SQL must not build object names (table/column/schema) at runtime. "
+            "Bans EXECUTE IMMEDIATE, sp_executesql, IDENTIFIER(...) naming an object, and "
+            "||/+/CONCAT assembly of an identifier. Value concatenation is fine; identifier "
+            "concatenation is not. Dynamic SQL is an injection surface AND it defeats "
+            "grain_guard/mesa_verifier — they cannot parse a runtime-assembled query, so "
+            "they fail OPEN (SPEC_65). This rule closes that hole."
+        ),
+        "why_immutable": (
+            "If a definition can assemble its own query at runtime, no static validator ever "
+            "sees the real SQL. Every other MESA guarantee becomes unenforceable. Same class "
+            "as SELECT * — it makes the compiler's promise structurally void."
+        ),
+        "detection": {
+            "type": "regex",
+            "pattern": r"\bEXECUTE\s+IMMEDIATE\b|\bsp_executesql\b|\bIDENTIFIER\s*\(",
+            "flags": re.IGNORECASE,
+        },
+        "error_message": (
+            "Dynamic SQL / runtime identifier construction detected. MESA definitions must be "
+            "static — use ref()/source() for object names, never EXECUTE IMMEDIATE or "
+            "IDENTIFIER(). Dynamic SQL defeats grain and identity validation."
+        ),
+        "bypassed_by_guided_authoring": True,
+        "severity": "blocking",
+    },
+
+    "MESA-CORE-008": {
+        "name": "Jinja allowlist — only safe constructs permitted",
+        "description": (
+            "Only {{ ref(...) }}, {{ source(...) }}, and known-safe macros/vars may appear in "
+            "metric/raw/view definitions. Any other {{ ... }} interpolation blocks. This prevents "
+            "injection of arbitrary SQL via Jinja variables at compile time, which would defeat "
+            "every static validator exactly like EXECUTE IMMEDIATE does at runtime."
+        ),
+        "why_immutable": (
+            "The compiler expands {{ ... }} before any rule runs. An arbitrary Jinja variable can "
+            "inject any SQL. Allowing that makes static validation impossible — same failure mode "
+            "as dynamic SQL. The allowlist must be locked to maintain the compile-time guarantee."
+        ),
+        "detection": {
+            "type": "callable",  # checked in validate_metric_sql / validate_view_sql
+        },
+        "error_message": (
+            "Disallowed Jinja construct detected. Only {{ ref(...) }}, {{ source(...) }}, and "
+            "{{ config(...) }} are permitted. Arbitrary Jinja variables defeat static validation."
+        ),
+        "bypassed_by_guided_authoring": True,
+        "severity": "blocking",
+    },
 }
 
 
@@ -283,7 +336,65 @@ def validate_metric_sql(
                 ),
             ))
 
+    # MESA-CORE-007: No dynamic SQL
+    rule = CORE_RULES["MESA-CORE-007"]
+    if re.search(rule["detection"]["pattern"], definition_sql, rule["detection"]["flags"]):
+        violations.append(CoreRuleViolation(
+            rule_code="MESA-CORE-007",
+            rule_name=rule["name"],
+            error_message=rule["error_message"],
+        ))
+
+    # MESA-CORE-008: Jinja allowlist
+    disallowed_jinja = _find_disallowed_jinja(definition_sql)
+    if disallowed_jinja:
+        violations.append(CoreRuleViolation(
+            rule_code="MESA-CORE-008",
+            rule_name=CORE_RULES["MESA-CORE-008"]["name"],
+            error_message=(
+                f"{CORE_RULES['MESA-CORE-008']['error_message']} "
+                f"Found: {', '.join(disallowed_jinja)}"
+            ),
+        ))
+
     return violations
+
+
+# Allowed Jinja constructs in MESA definitions (CORE-008)
+_ALLOWED_JINJA_PATTERNS = [
+    r"\{\{\s*ref\s*\(",          # {{ ref(...) }}
+    r"\{\{\s*source\s*\(",       # {{ source(...) }}
+    r"\{\{\s*config\s*\(",       # {{ config(...) }}
+    # Add more known-safe macros here as needed
+]
+
+
+def _find_disallowed_jinja(sql: str) -> list[str]:
+    """
+    Find any {{ ... }} Jinja constructs that are NOT in the allowlist.
+    Returns a list of offending constructs found.
+
+    MESA-CORE-008: only ref(), source(), and config() are allowed.
+    Any other Jinja variable can inject arbitrary SQL at compile time.
+    """
+    disallowed = []
+    # Find all {{ ... }} constructs
+    jinja_pattern = r"\{\{([^}]+)\}\}"
+    for match in re.finditer(jinja_pattern, sql):
+        construct = match.group(0)  # The full {{ ... }}
+        inner = match.group(1).strip()  # Just the inner content
+
+        # Check if it matches any allowed pattern
+        is_allowed = False
+        for allowed_pattern in _ALLOWED_JINJA_PATTERNS:
+            if re.match(allowed_pattern, construct, re.IGNORECASE):
+                is_allowed = True
+                break
+
+        if not is_allowed:
+            disallowed.append(construct)
+
+    return disallowed
 
 
 def validate_expression(expression: str) -> list[CoreRuleViolation]:
