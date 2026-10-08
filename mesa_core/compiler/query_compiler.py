@@ -154,7 +154,7 @@ def _build_widetable(entity: Entity, metrics: list[Metric], warehouse: str) -> t
         ), []
 
     elif warehouse == "Snowflake":
-        return _build_widetable_snowflake(entity), []
+        return _build_widetable_snowflake(entity, metrics), []
 
     elif warehouse in _TSQL_WAREHOUSES:
         return _build_widetable_tsql(entity), []
@@ -172,16 +172,16 @@ def _build_widetable(entity: Entity, metrics: list[Metric], warehouse: str) -> t
         ), []
 
 
-def _build_widetable_snowflake(entity: Entity) -> str:
+def _build_widetable_snowflake(entity: Entity, metrics: list[Metric]) -> str:
     """
     SPEC_72 (combiner architecture) — the Snowflake wide render, byte-matching
-    CAO's ``tools/generate_wide_layer.py`` ``build_wide_sql``. TWO qualified-
-    wildcard ``OBJECT_CONSTRUCT(alias.*)`` columns — the raw entity and the
-    combiner — joined ONCE. No per-metric column list, no per-metric cast; the
-    combiner model (``_build_combiner_snowflake``) already did that work.
+    CAO's ``tools/generate_wide_layer.py`` ``build_wide_sql``. TWO OBJECT
+    columns — the raw entity and the combiner — joined ONCE. No per-metric
+    join, no per-metric cast; the combiner model (``_build_combiner_snowflake``)
+    already did that work.
 
-    EXCEPTION (verified against real Farmers PolicyRaw, 2026-09-23): the
-    wildcard ``OBJECT_CONSTRUCT({entity_var}.*)`` form CANNOT expand a raw
+    RAW SIDE EXCEPTION (verified against real Farmers PolicyRaw, 2026-09-23):
+    the wildcard ``OBJECT_CONSTRUCT({entity_var}.*)`` form CANNOT expand a raw
     column that is itself a typed ``OBJECT(...)``/``ARRAY(OBJECT(...))`` —
     Snowflake raises "Function OBJECT_CONSTRUCT(*) does not support
     OBJECT(...) argument type". Every MESA raw entity following the Raw
@@ -190,8 +190,24 @@ def _build_widetable_snowflake(entity: Entity) -> str:
     parses the raw entity's OWN authored SQL; if it finds any OBJECT/ARRAY-
     typed column, the RAW side switches to the explicit key/value form
     (matching the CustomerAddressWide hand-patch shape, but generated
-    instead of hand-maintained). The combiner side is UNCHANGED — the
-    combiner model is always flat-typed by construction, never nested.
+    instead of hand-maintained).
+
+    METRICS SIDE — ALWAYS explicit key/value, NEVER the qualified wildcard
+    (fixed 2026-09-28, verified against real Farmers production data).
+    Snowflake's ``OBJECT_CONSTRUCT(alias.*)`` uses the column's STORED
+    (case-folded/uppercase) name as the JSON key text — it does NOT preserve
+    the PascalCase the metric file/column was written with. Every view over
+    this wide table accesses metrics with PascalCase colon-accessors (e.g.
+    ``PolicyMetrics:NumberOfAgentChangeEvents``) to match the RAW side's
+    explicit 'PascalCase' key literals — the wildcard silently broke that
+    contract (accessor case != stored key case => NULL, with NO error
+    thrown). Confirmed in production: ``ChangedProducer`` returned 0 rows,
+    three onboarding views returned "No data", with the query executing
+    successfully. Fix: build ID + every metric name as an explicit
+    ``'MetricName', alias.MetricName`` pair — exactly mirroring the RAW
+    side's explicit-key pattern. Still zero-maintenance: the metric name
+    list comes from ``metrics`` (the same list the combiner was built from),
+    so a new metric "just shows up" here automatically on the next compile.
     """
     entity_var = entity.entity_name  # raw-relation alias
     metrics_var = f"{entity_var}Metrics"  # combiner alias
@@ -200,6 +216,11 @@ def _build_widetable_snowflake(entity: Entity) -> str:
 
     raw_columns = detect_wide_columns(getattr(entity, "definition_sql", "") or "")
     needs_explicit_raw = has_typed_column(raw_columns)
+
+    metrics_columns = ["ID"] + [m.metric_name for m in metrics]
+    metrics_select = build_explicit_object_construct(
+        metrics_var, [(name, False) for name in metrics_columns], indent="    ", as_alias=metrics_var
+    ) + "\n"
 
     header_lines = [
         f"-- WIDE LAYER: {entity_var} Wide Table (AUTO-GENERATED)\n",
@@ -211,13 +232,23 @@ def _build_widetable_snowflake(entity: Entity) -> str:
             f"-- OBJECT_CONSTRUCT({entity_var}.*) wildcard cannot auto-expand a typed\n"
             f"-- nested column, so the {entity_var} side below uses an EXPLICIT\n"
             f"-- key/value OBJECT_CONSTRUCT with ::VARIANT casts on the typed columns.\n"
-            f"-- The {metrics_var} combiner side is unaffected (always flat-typed).\n"
         )
     else:
         header_lines.append(
-            f"-- Snowflake OBJECT_CONSTRUCT(alias.*) — qualified wildcard, auto-expanding.\n"
-            f"-- No explicit column list, no logic, zero maintenance.\n"
+            f"-- {entity_var} side: explicit key/value OBJECT_CONSTRUCT (no typed columns\n"
+            f"-- detected, but explicit keys are used uniformly — see {metrics_var} note below).\n"
         )
+    header_lines.append(
+        f"-- {metrics_var} side: explicit key/value OBJECT_CONSTRUCT — NOT the qualified\n"
+        f"-- wildcard OBJECT_CONSTRUCT({metrics_var}.*). Snowflake's wildcard form uses the\n"
+        f"-- column's STORED (case-folded) name as the JSON key, silently breaking every\n"
+        f"-- PascalCase colon-accessor (e.g. {metrics_var}:NumberOfAgentChangeEvents) written\n"
+        f"-- against it — the key ends up uppercase, the accessor doesn't match, and the\n"
+        f"-- result is a silent NULL with no error. Fixed 2026-09-28 (see git history) —\n"
+        f"-- keys are now the exact metric column names, still auto-derived from the\n"
+        f"-- entity's published metric list, so adding a metric and recompiling still\n"
+        f"-- requires zero hand-editing here.\n"
+    )
     header_lines.append(
         f"-- Regenerate after adding/removing a file in models/metric_layer/{entity_var}_Metrics/:\n"
         f"--   python3 tools/generate_metrics_combiner.py --entity {entity_var}\n"
@@ -226,14 +257,6 @@ def _build_widetable_snowflake(entity: Entity) -> str:
         f"-- its output, {combiner_model}, not the individual metric files.)\n"
         f"-- Owner: CI/CD (mechanically generated, do not edit by hand)\n"
         f"--\n"
-        f"-- HOW IT WORKS (Snowflake):\n"
-        f"--   OBJECT_CONSTRUCT({metrics_var}.*) packs the combined metrics alias into a named OBJECT.\n"
-        f"--   The qualified wildcard (alias.*) ensures each OBJECT only contains columns from its own source.\n"
-        f"--   Adding a column upstream (a new metric file + combiner regen) expands the OBJECT automatically —\n"
-        f"--   nothing downstream breaks.\n"
-        f"--\n"
-        f"--   NOTE: bare OBJECT_CONSTRUCT(*) after a JOIN is WRONG — it packs ALL joined columns into BOTH objects.\n"
-        f"--   Always qualify with the alias.\n"
         f"-- Consumer access: {entity_var}Wide.{entity_var}:<Field> / {entity_var}Wide.{metrics_var}:<MetricName> / ...\n"
     )
     header = "".join(header_lines)
@@ -248,7 +271,7 @@ def _build_widetable_snowflake(entity: Entity) -> str:
     body = (
         f"SELECT\n"
         f"{raw_select}"
-        f"    , OBJECT_CONSTRUCT({metrics_var}.*) AS {metrics_var}\n"
+        f"    , {metrics_select.lstrip()}"
         f"FROM {{{{ ref('{entity_var}Raw') }}}} AS {entity_var}\n"
         f"{join_type} JOIN {{{{ ref('{combiner_model}') }}}} AS {metrics_var}\n"
         f"    ON {entity_var}.ID = {metrics_var}.ID\n"

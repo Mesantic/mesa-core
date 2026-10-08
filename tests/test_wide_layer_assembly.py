@@ -2,10 +2,22 @@
 test_wide_layer_assembly.py — SPEC_72 (combiner architecture).
 
 Prove the Snowflake wide-layer rewrite produces CAO's decided two-OBJECT
-combiner form (``OBJECT_CONSTRUCT(alias.*)`` x2, ONE join to a per-entity
-combiner model), that the combiner model itself is emitted with the correct
-COALESCE-defaulted columns, and that ``mesa build --check`` detects drift in
-either file.
+combiner form (raw side: qualified-wildcard ``OBJECT_CONSTRUCT(alias.*)``
+unless a typed column forces the explicit form; metrics side: ALWAYS
+explicit key/value ``OBJECT_CONSTRUCT('MetricName', alias.MetricName, ...)``
+— never the wildcard, per the 2026-09-28 key-casing fix), ONE join to a
+per-entity combiner model, that the combiner model itself is emitted with
+the correct COALESCE-defaulted columns, and that ``mesa build --check``
+detects drift in either file.
+
+KEY-CASING FIX (2026-09-28): Snowflake's ``OBJECT_CONSTRUCT(alias.*)``
+stores each key using the column's case-folded (uppercase) name, not its
+authored PascalCase name. Every consumer view accesses metrics with a
+PascalCase colon-accessor — the wildcard silently NULLs every accessor with
+no error. Confirmed in a real deployment where multiple consumer views
+returned zero rows / "No data" despite the query succeeding. The metrics
+side must always use explicit keys so the stored key text matches the
+metric's authored name exactly.
 """
 
 import pytest
@@ -73,9 +85,20 @@ def test_snowflake_wide_is_two_object_combiner_form():
     # Header matches CAO's decided combiner form.
     assert "-- WIDE LAYER: ChangeEvent Wide Table (AUTO-GENERATED)" in sql
 
-    # Exactly two qualified-wildcard OBJECT_CONSTRUCT columns.
+    # Raw side stays the qualified wildcard (no typed columns on this entity).
     assert "OBJECT_CONSTRUCT(ChangeEvent.*) AS ChangeEvent" in sql
-    assert "OBJECT_CONSTRUCT(ChangeEventMetrics.*) AS ChangeEventMetrics" in sql
+
+    # Metrics side: explicit PascalCase key/value pairs, NOT the qualified
+    # wildcard (2026-09-28 key-casing fix — see _build_widetable_snowflake
+    # docstring). The wildcard silently breaks every PascalCase colon-
+    # accessor because Snowflake stores the wildcard-expanded key in its
+    # case-folded (uppercase) form.
+    assert "OBJECT_CONSTRUCT(ChangeEventMetrics.*) AS ChangeEventMetrics" not in sql
+    assert "'ID', ChangeEventMetrics.ID" in sql
+    assert "'IsAgentChangeEvent', ChangeEventMetrics.IsAgentChangeEvent" in sql
+    assert "'IsZipChangeEvent', ChangeEventMetrics.IsZipChangeEvent" in sql
+    assert "'RetentionRate', ChangeEventMetrics.RetentionRate" in sql
+    assert ") AS ChangeEventMetrics" in sql
 
     # ONE join, to the combiner model — not one join per metric.
     assert "LEFT JOIN {{ ref('change_event_metrics') }} AS ChangeEventMetrics" in sql
@@ -84,10 +107,35 @@ def test_snowflake_wide_is_two_object_combiner_form():
     assert body.count("JOIN") == 1
 
     # No per-metric typed casts or per-metric joins leaked into the wide file.
-    assert "::OBJECT(" not in sql
     assert "OBJECT_CONSTRUCT_KEEP_NULL" not in sql
     assert "as_struct" not in sql
     assert "{{ source(" not in sql
+
+
+def test_snowflake_metrics_side_never_uses_wildcard_and_keys_match_metric_case():
+    """Regression test for the 2026-09-28 key-casing bug: Snowflake's
+    qualified-wildcard OBJECT_CONSTRUCT(alias.*) stores each key using the
+    column's case-folded (uppercase) name, not its authored PascalCase name.
+    Every consumer view accesses metrics with a PascalCase colon-accessor
+    (e.g. PolicyMetrics:NumberOfAgentChangeEvents) — the wildcard form
+    silently NULLs every one of those accessors with no error thrown.
+    Confirmed in production: ChangedProducer and 3 onboarding views all
+    returned zero rows / "No data" while the underlying query succeeded.
+    The metrics side must ALWAYS use explicit key/value pairs so the stored
+    key text matches the metric's authored PascalCase name exactly."""
+    entity = _change_event_entity()
+    metrics = _change_event_metrics()
+    result = compile_entity(entity, metrics, "Snowflake")
+    sql = result.compiled_widetable_sql
+
+    # No CODE line emits the wildcard on the metrics side (explanatory
+    # header comments are allowed to mention the pattern by name).
+    code_lines = [line for line in sql.splitlines() if not line.strip().startswith("--")]
+    code_only = "\n".join(code_lines)
+    assert "OBJECT_CONSTRUCT(ChangeEventMetrics.*)" not in code_only
+
+    for metric in metrics:
+        assert f"'{metric.metric_name}', ChangeEventMetrics.{metric.metric_name}" in sql
 
 
 def test_snowflake_inner_join_for_inner_entity():
@@ -218,8 +266,12 @@ def test_typed_object_raw_column_uses_explicit_object_construct():
     assert "'SystemIds', Policy.SystemIds::VARIANT" in sql
     assert "'MonthlySnapshots', Policy.MonthlySnapshots::VARIANT" in sql
 
-    # COMBINER side: unchanged wildcard form.
-    assert "OBJECT_CONSTRUCT(PolicyMetrics.*) AS PolicyMetrics" in sql
+    # COMBINER side: also explicit key/value form (2026-09-28 key-casing
+    # fix) — never the qualified wildcard, regardless of whether the raw
+    # side needed the typed-column workaround.
+    assert "OBJECT_CONSTRUCT(PolicyMetrics.*) AS PolicyMetrics" not in sql
+    assert "'ID', PolicyMetrics.ID" in sql
+    assert "'InForce90Flag', PolicyMetrics.InForce90Flag" in sql
     assert "INNER JOIN {{ ref('policy_metrics') }} AS PolicyMetrics" in sql
 
 

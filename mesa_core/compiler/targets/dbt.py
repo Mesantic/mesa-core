@@ -715,7 +715,10 @@ class MesaDbtEmitter:
         ))
 
         # ── 4. Wide model (dialect-aware) ─────────────────────────────────
-        wide_sql = build_wide_model(entity, self._dialect)
+        # Pass all_metrics so the Snowflake branch can emit explicit
+        # PascalCase keys on the metrics side instead of the unsafe
+        # OBJECT_CONSTRUCT(alias.*) wildcard (2026-09-28 key-casing fix).
+        wide_sql = build_wide_model(entity, self._dialect, metrics=all_metrics)
         artifacts.append(Artifact(
             kind="file",
             object_type="dbt_wide",

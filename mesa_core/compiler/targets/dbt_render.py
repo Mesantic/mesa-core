@@ -60,6 +60,8 @@ from __future__ import annotations
 import re
 from typing import Literal
 
+from mesa_core.compiler.wide_columns import build_explicit_object_construct
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _snake(name: str) -> str:
@@ -383,7 +385,7 @@ def build_assembler_model(entity, metrics) -> str:
 
 # ── Wide model — dialect matrix ────────────────────────────────────────────────
 
-def build_wide_model(entity, dialect: str = "bigquery") -> str:
+def build_wide_model(entity, dialect: str = "bigquery", metrics=None) -> str:
     """
     Build the wide-layer SQL body.
 
@@ -391,11 +393,30 @@ def build_wide_model(entity, dialect: str = "bigquery") -> str:
     composite/auto-expand capability.  See SPEC_41 §TWO RENDER MODES.
 
     BigQuery (default): bare-alias STRUCT — SELECT <Entity>, <Entity>Metrics
-    Snowflake:          OBJECT_CONSTRUCT(*) scoped per source via correlated subquery
+    Snowflake:          explicit key/value OBJECT_CONSTRUCT per source (see
+                        SNOWFLAKE KEY-CASING FIX below — never the qualified
+                        wildcard on the metrics side)
     Redshift/Postgres:  dbt_utils.star() for explicit, name-safe column list
 
     NEVER emit a bare BigQuery-style SELECT for a non-BQ dialect — it will not
     execute on Snowflake/Redshift and would silently produce wrong data.
+
+    SNOWFLAKE KEY-CASING FIX (2026-09-28, verified against real production
+    data): Snowflake's qualified-wildcard ``OBJECT_CONSTRUCT(alias.*)`` uses
+    each column's STORED (case-folded/uppercase) name as the JSON key text —
+    it does NOT preserve the PascalCase the metric was written with. Every
+    consumer view accesses metrics with a PascalCase colon-accessor (e.g.
+    ``EntityMetrics:SomeMetricName``) to match the raw side's explicit
+    'PascalCase' key literals — the wildcard silently broke that contract
+    (accessor case != stored key case => NULL, with no error). Confirmed in
+    a real deployment: multiple consumer views returned zero rows / "No
+    data" with the query executing successfully. Fix: the metrics side now
+    always emits an explicit ``'MetricName', alias.MetricName`` pair per
+    metric — pass ``metrics`` (the entity's published metric list) so this
+    stays zero-maintenance; a new metric "just shows up" on the next compile.
+    If ``metrics`` is omitted, this falls back to the (unsafe) wildcard form
+    for backward compatibility with existing callers — callers should be
+    updated to pass ``metrics`` wherever the metric list is available.
     """
     entity_name = entity.entity_name
     entity_snake = _snake(entity_name)
@@ -422,15 +443,26 @@ def build_wide_model(entity, dialect: str = "bigquery") -> str:
         )
 
     elif norm_dialect in ("snowflake", "sf"):
-        # OBJECT_CONSTRUCT(alias.*) — qualified wildcard, auto-expanding.
-        # Each OBJECT_CONSTRUCT is scoped to its own source via alias.* so only
-        # that model's columns are packed.  Bare OBJECT_CONSTRUCT(*) after a JOIN
-        # is WRONG — it packs ALL joined columns into BOTH objects.
+        # Raw side: OBJECT_CONSTRUCT(alias.*) — qualified wildcard,
+        # auto-expanding. Bare OBJECT_CONSTRUCT(*) after a JOIN is WRONG —
+        # it packs ALL joined columns into BOTH objects.
         # Proven live on Snowflake 2026-07-17 (model_zoo_sf, PASS=55).
+        #
+        # Metrics side: explicit key/value OBJECT_CONSTRUCT — NOT the
+        # qualified wildcard. See the SNOWFLAKE KEY-CASING FIX docstring
+        # note above for why the wildcard is unsafe here.
+        if metrics:
+            metrics_columns = ["ID"] + [m.metric_name for m in metrics]
+            metrics_select = build_explicit_object_construct(
+                f"{entity_name}Metrics", [(name, False) for name in metrics_columns],
+                indent="    ", as_alias=f"{entity_name}Metrics",
+            )
+        else:
+            metrics_select = f"    OBJECT_CONSTRUCT({entity_name}Metrics.*) AS {entity_name}Metrics"
         body = (
             f"SELECT\n"
             f"    OBJECT_CONSTRUCT({entity_name}.*) AS {entity_name}\n"
-            f"    , OBJECT_CONSTRUCT({entity_name}Metrics.*) AS {entity_name}Metrics\n"
+            f"    , {metrics_select.lstrip()}\n"
             f"FROM {{{{ ref('{raw_ref}') }}}} AS {entity_name}\n"
             f"JOIN {{{{ ref('{entity_metrics_ref}') }}}} AS {entity_name}Metrics\n"
             f"    ON {entity_name}.ID = {entity_name}Metrics.ID"
