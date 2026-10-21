@@ -42,10 +42,16 @@ def compile_entity(entity: Entity, metrics: list[Metric], warehouse: str) -> Com
     widetable_sql, type_inference_warnings = _build_widetable(entity, metrics, warehouse)
 
     combiner_sql = ""
+    # SPEC_101 Slice 1: heuristic-sourced COMBINER_DEFAULTs are surfaced for the
+    # combiner warehouses (Snowflake + the T-SQL targets). BigQuery/Redshift/DuckDB
+    # emit no combiner model, so there is no default to warn about.
+    annotation_warnings: list[str] = []
     if warehouse == "Snowflake":
         combiner_sql = _build_combiner_snowflake(entity, metrics)
+        annotation_warnings = _combiner_default_warnings(entity, metrics)
     elif warehouse in _TSQL_WAREHOUSES:
         combiner_sql = _build_combiner_tsql(entity, metrics)
+        annotation_warnings = _combiner_default_warnings(entity, metrics)
         # SPEC_76 — the T-SQL combiner's flat-column CAST infers a type per
         # metric; surface any metric that fell back to VARCHAR(MAX) so the
         # caller (CLI/Mesantic) can warn — same discipline as Snowflake.
@@ -59,6 +65,7 @@ def compile_entity(entity: Entity, metrics: list[Metric], warehouse: str) -> Com
         compiled_widetable_sql=widetable_sql,
         compiled_combiner_sql=combiner_sql,
         type_inference_warnings=type_inference_warnings,
+        annotation_warnings=annotation_warnings,
     )
 
 
@@ -321,7 +328,11 @@ def _build_combiner_snowflake(entity: Entity, metrics: list[Metric]) -> str:
 
     select_lines = [f"    {entity_var}.ID"]
     for metric in metrics:
-        default = resolve_combiner_default(metric.definition_sql)
+        # SPEC_101 Slice 1: the annotation lives in the file header, which the
+        # loader stripped — pass it explicitly rather than regex the body.
+        default = resolve_combiner_default(
+            metric.definition_sql, metric.annotation("COMBINER_DEFAULT")
+        )
         if default is None:
             select_lines.append(f"    , {metric.metric_name}.{metric.metric_name}")
         else:
@@ -385,13 +396,39 @@ def _tsql_type_warnings(entity: Entity, metrics: list[Metric]) -> list[str]:
     silent. Deterministic (metric order preserved)."""
     warnings: list[str] = []
     for metric in metrics:
-        tsql_type, was_inferred = resolve_tsql_type(metric.definition_sql)
+        tsql_type, was_inferred = resolve_tsql_type(
+            metric.definition_sql, metric.annotation("WIDE_TYPE_TSQL")
+        )
         if was_inferred:
             warnings.append(
                 f"T-SQL type inferred for {entity.entity_name}.{metric.metric_name} "
                 f"-> {tsql_type} (no -- WIDE_TYPE_TSQL: annotation). "
                 f"Add an annotation to pin the type."
             )
+    return warnings
+
+
+def _combiner_default_warnings(entity: Entity, metrics: list[Metric]) -> list[str]:
+    """SPEC_101 Slice 1 — warn when a combiner default came from the HEURISTIC
+    table rather than an explicit annotation.
+
+    The heuristic is unchanged and still applied (removing it would break every
+    existing project the day it shipped); this only makes the guess visible so
+    an author can pin it. Metrics that pass NULL through produce no warning —
+    there's no inferred value to confirm. Deterministic (metric order kept).
+    """
+    warnings: list[str] = []
+    for metric in metrics:
+        if metric.annotation("COMBINER_DEFAULT") is not None:
+            continue  # explicit — the author already decided
+        inferred = resolve_combiner_default(metric.definition_sql, None)
+        if inferred is None:
+            continue  # NULL passes through; nothing to confirm
+        warnings.append(
+            f"{entity.entity_name}.{metric.metric_name}: COMBINER_DEFAULT inferred as "
+            f"{inferred} — add '-- COMBINER_DEFAULT: {inferred}' to confirm, or "
+            f"'-- COMBINER_DEFAULT: NONE' if NULL is meaningful."
+        )
     return warnings
 
 
@@ -450,8 +487,12 @@ def _build_combiner_tsql(entity: Entity, metrics: list[Metric]) -> str:
     # (flag/count/money/rate); scores/averages/deltas pass NULL through.
     select_lines = [f"    {entity_var}.ID AS ID"]
     for metric in metrics:
-        tsql_type, _inferred = resolve_tsql_type(metric.definition_sql)
-        default = resolve_combiner_default(metric.definition_sql)
+        tsql_type, _inferred = resolve_tsql_type(
+            metric.definition_sql, metric.annotation("WIDE_TYPE_TSQL")
+        )
+        default = resolve_combiner_default(
+            metric.definition_sql, metric.annotation("COMBINER_DEFAULT")
+        )
         if default is None:
             select_lines.append(
                 f"    , CAST({metric.metric_name}.{metric.metric_name} AS {tsql_type}) AS {metric.metric_name}"

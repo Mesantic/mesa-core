@@ -85,6 +85,9 @@ class BuildResult:
     warnings collected while assembling the Snowflake wide layer."""
     written: list[Path] = field(default_factory=list)
     type_inference_warnings: list[str] = field(default_factory=list)
+    # SPEC_101 Slice 1: heuristic-sourced COMBINER_DEFAULT warnings (see
+    # ``query_compiler._combiner_default_warnings``). Printed to stderr by the CLI.
+    annotation_warnings: list[str] = field(default_factory=list)
 
 
 def build(project: Project, target_dir: str | Path = "target") -> BuildResult:
@@ -97,6 +100,7 @@ def build(project: Project, target_dir: str | Path = "target") -> BuildResult:
     target = Path(target_dir)
     written: list[Path] = []
     warnings: list[str] = []
+    annotation_warnings: list[str] = []
 
     # Raw layer — verbatim authored SQL.
     raw_dir = target / "raw_layer"
@@ -131,6 +135,7 @@ def build(project: Project, target_dir: str | Path = "target") -> BuildResult:
         written.append(wpath)
 
         warnings.extend(result.type_inference_warnings)
+        annotation_warnings.extend(result.annotation_warnings)
 
     # View layer — verbatim authored SQL.
     view_dir = target / "view_layer"
@@ -139,7 +144,11 @@ def build(project: Project, target_dir: str | Path = "target") -> BuildResult:
         _write_generated(path, view.definition_sql or "")
         written.append(path)
 
-    return BuildResult(written=written, type_inference_warnings=warnings)
+    return BuildResult(
+        written=written,
+        type_inference_warnings=warnings,
+        annotation_warnings=annotation_warnings,
+    )
 
 
 def check_wide_layer(project: Project, models_dir: str | Path) -> list[str]:

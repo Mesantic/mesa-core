@@ -54,10 +54,19 @@ TYPE_HEURISTICS: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def resolve_wide_type(metric_sql: str) -> tuple[str, bool]:
+def resolve_wide_type(metric_sql: str, annotation: str | None = None) -> tuple[str, bool]:
     """Returns (snowflake_type, was_inferred). was_inferred=True means
     no explicit WIDE_TYPE annotation was found and a heuristic (or the
-    VARCHAR fallback) was used — caller should warn in that case."""
+    VARCHAR fallback) was used — caller should warn in that case.
+
+    SPEC_101 Slice 1: the annotation is passed in explicitly (read from the
+    file's leading comment block by ``annotations.parse_annotations``) because
+    ``metric_sql`` is the STRIPPED body and no longer carries the header. The
+    regex fallback is kept so a caller that still hands over raw text works.
+    """
+    if annotation:
+        return annotation.strip().upper(), False
+
     m = WIDE_TYPE_ANNOTATION_RE.search(metric_sql)
     if m:
         return m.group(1).strip().upper(), False
@@ -107,13 +116,20 @@ TSQL_TYPE_HEURISTICS: list[tuple[re.Pattern, str]] = [
 ]
 
 
-def resolve_tsql_type(metric_sql: str) -> tuple[str, bool]:
+def resolve_tsql_type(metric_sql: str, annotation: str | None = None) -> tuple[str, bool]:
     """Returns (tsql_type, was_inferred) for the flat-column ``CAST``.
 
     Annotation (``-- WIDE_TYPE_TSQL:``) wins; otherwise the T-SQL heuristic
     table; otherwise VARCHAR(MAX) with ``was_inferred=True`` so the caller can
     surface the same fallback warning Snowflake does.
+
+    SPEC_101 Slice 1: the annotation is passed in explicitly (from
+    ``annotations.parse_annotations``) because ``metric_sql`` is the stripped
+    body. The regex fallback stays for raw-text callers.
     """
+    if annotation:
+        return annotation.strip().upper(), False
+
     m = WIDE_TYPE_TSQL_ANNOTATION_RE.search(metric_sql)
     if m:
         return m.group(1).strip().upper(), False

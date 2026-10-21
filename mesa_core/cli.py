@@ -254,6 +254,11 @@ def build(models_dir: str, check_only: bool) -> None:
     for warning in result.type_inference_warnings:
         click.echo(click.style(warning, fg="yellow"), err=True)
 
+    # SPEC_101 Slice 1: heuristic-sourced COMBINER_DEFAULTs — a nudge to pin the
+    # default with an annotation, never a build failure.
+    for warning in result.annotation_warnings:
+        click.echo(click.style(warning, fg="yellow"), err=True)
+
     click.echo(f"Compiled {proj.name} ({len(proj.entities)} entities) -> {len(result.written)} files in {target_dir}/.")
 
 

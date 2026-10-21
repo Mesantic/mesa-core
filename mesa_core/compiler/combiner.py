@@ -47,13 +47,44 @@ DEFAULT_HEURISTICS: list[tuple[re.Pattern, str]] = [
 # with no agent-change survey would look like it scored a 0 CSAT.
 
 
-def resolve_combiner_default(metric_sql: str) -> str | None:
+# A deliberate NULL pass-through. `COMBINER_DEFAULT: NONE` (or NULL) means the
+# metric is *annotated* to have no zero-fill — its NULL stays NULL. Before
+# SPEC_101 Slice 1 the annotation branch returned the literal 'NONE', so the
+# compiler emitted `COALESCE(col, NONE)` — invalid SQL. The only reason that
+# never fired in production is the strip bug now fixed in the same slice.
+_NULL_ANNOTATION_VALUES = frozenset({"NONE", "NULL"})
+
+
+def resolve_combiner_default(metric_sql: str, annotation: str | None = None) -> str | None:
     """Returns the literal default expression to ``COALESCE`` with, or
     ``None`` if no default should be applied (metric passes through raw,
-    NULL-preserving)."""
+    NULL-preserving).
+
+    SPEC_101 Slice 1 — the annotation is an explicit argument, read from the
+    metric file's leading header by ``annotations.parse_annotations``. It has to
+    come from the file text, not from ``metric_sql``: the loader strips the
+    header before the compiler ever sees the SQL, so a regex over the body can
+    never match a real annotation.
+
+    Annotation semantics:
+      ``NONE`` / ``NULL`` (case-insensitive) -> ``None`` (deliberate NULL signal)
+      anything else                         -> that literal, stripped
+      no annotation                         -> heuristic table (unchanged)
+    """
+    if annotation is not None:
+        value = annotation.strip()
+        if value.upper() in _NULL_ANNOTATION_VALUES:
+            return None
+        return value
+
     m = COMBINER_DEFAULT_ANNOTATION_RE.search(metric_sql)
     if m:
-        return m.group(1).strip()
+        # Raw-text fallback for any caller still handing over an unstripped file.
+        # Same NONE guard: never emit the literal 'NONE' into COALESCE.
+        value = m.group(1).strip()
+        if value.upper() in _NULL_ANNOTATION_VALUES:
+            return None
+        return value
 
     for pattern, default in DEFAULT_HEURISTICS:
         if pattern.search(metric_sql):

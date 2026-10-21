@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from mesa_core.model import Entity, Metric, View
+from mesa_core.annotations import is_annotation_line, parse_annotations
 
 try:
     import yaml
@@ -199,6 +200,11 @@ def _parse_metric_header(sql: str) -> dict:
             # skip decorative separators like "----"
             continue
         if stripped.startswith("-- "):
+            # SPEC_101 Slice 1: an annotation directive is machine metadata, not
+            # prose. Without this skip a file whose only "description" is
+            # `-- WIDE_TYPE: FLOAT` passed the documentation-completeness check.
+            if is_annotation_line(line):
+                continue
             text = stripped[3:].strip()
             if text and not _RAW_ENTITY_RE.match(stripped):
                 prose.append(text)
@@ -344,6 +350,10 @@ def _load_metrics(models_dir: Path, errors: list[str]) -> list[Metric]:
             metric_name = sql_file.stem
             header = _parse_metric_header(sql)
             body = _strip_config_and_header(sql)
+            # SPEC_101 Slice 1: read annotations from the RAW file text — the
+            # stripped `body` no longer carries the leading comment block, which
+            # is exactly where these directives live.
+            annotations = tuple(sorted(parse_annotations(sql).items()))
             if not body.strip():
                 errors.append(f"{sql_file}: empty SQL body after stripping config/header")
                 continue
@@ -354,6 +364,7 @@ def _load_metrics(models_dir: Path, errors: list[str]) -> list[Metric]:
                 owner=header.get("owner"),
                 contract=header.get("contract"),
                 description=header.get("description"),
+                annotations=annotations,
             ))
     return metrics
 

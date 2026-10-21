@@ -63,6 +63,19 @@ class Metric:
     owner: str | None = None
     contract: str | None = None
     description: str | None = None
+    # SPEC_101 Slice 1: machine annotations from the leading header block
+    # (COMBINER_DEFAULT / WIDE_TYPE / WIDE_TYPE_TSQL), read from the RAW file
+    # text before the loader strips the header. A tuple of pairs, not a dict —
+    # `Metric` is frozen and has to stay hashable.
+    annotations: tuple[tuple[str, str], ...] = ()
+
+    def annotation(self, key: str) -> str | None:
+        """Return the annotation value for ``key`` (case-insensitive), or None."""
+        target = key.upper()
+        for k, v in self.annotations:
+            if k.upper() == target:
+                return v
+        return None
 
 
 @dataclass(frozen=True)
@@ -93,3 +106,7 @@ class CompileResult:
     # ``-- WIDE_TYPE:`` annotation). A caller (Mesantic) surfaces these; the
     # CLI prints them to stderr. Never silently cast to VARCHAR without notice.
     type_inference_warnings: list[str] = field(default_factory=list)
+    # SPEC_101 Slice 1: metrics whose COMBINER_DEFAULT came from the heuristic
+    # table rather than an explicit annotation. Printed to stderr beside
+    # ``type_inference_warnings`` — a nudge to annotate, never a block.
+    annotation_warnings: list[str] = field(default_factory=list)
