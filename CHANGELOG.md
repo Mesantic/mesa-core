@@ -39,9 +39,11 @@ Two consequences worth knowing:
 (removing it outright would break every existing project on the day it shipped).
 To make those guesses visible, `mesa build` now prints a warning per
 heuristic-sourced default on stderr, telling you exactly what to write to confirm
-it. It's a nudge, not a block. Annotations from your docs-completeness check no
-longer leak into a metric's description prose, so a file whose only "description"
-was `-- WIDE_TYPE: FLOAT` no longer passes as documented.
+it. It's a nudge, not a block.
+
+One more fix rides along: annotation lines no longer leak into a metric's
+description. Before, a file whose only "description" was `-- WIDE_TYPE: FLOAT`
+passed the documentation-completeness check as if it were documented. It won't now.
 
 Nothing else changed. A project with no annotations anywhere compiles to the same
 combiner SQL it did before — the only new output is the warnings.
