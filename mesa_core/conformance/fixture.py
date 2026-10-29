@@ -99,6 +99,11 @@ NASTY_CASES: tuple[NastyCase, ...] = (
         description="A column with one distinct value — the signal test must WARN.",
         spec_row="Slice 6 (signal test)",
     ),
+    NastyCase(
+        key="IDENTITY_EXPR",
+        description="The compiler's own DuckDB identity expression vs a SHA-256 test vector.",
+        spec_row="Slice 2 (no existing ID changes)",
+    ),
 )
 
 # The fixture table. Deliberately plain ANSI so every warehouse can create it;

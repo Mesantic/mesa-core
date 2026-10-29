@@ -118,11 +118,30 @@ def _terminal_projection_has_division(metric_sql: str, dialect: str) -> tuple[bo
 
     for projection in select.expressions:
         for node in projection.walk():
-            if isinstance(node, _exp.Div):
-                return True, None
-            if isinstance(node, _exp.Anonymous) and str(node.this).upper() in _DIVISION_FUNCTIONS:
+            is_division = isinstance(node, _exp.Div) or (
+                isinstance(node, _exp.Anonymous)
+                and str(node.this).upper() in _DIVISION_FUNCTIONS
+            )
+            # A division INSIDE an aggregate is a row-level expression, not a
+            # ratio: SUM(AmountCents / 100) is a money total with a unit
+            # conversion and a genuine 0 when empty. Only a division applied
+            # to the aggregated results — SUM(a) / SUM(b) — is a ratio.
+            if is_division and not _inside_aggregate(node, projection):
                 return True, None
     return False, None
+
+
+def _inside_aggregate(node, boundary) -> bool:
+    """True when ``node`` sits under an aggregate function, walking up no
+    further than ``boundary`` (the projection that contains it)."""
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, _exp.AggFunc):
+            return True
+        if parent is boundary:
+            return False
+        parent = parent.parent
+    return False
 
 
 def resolve_combiner_default(

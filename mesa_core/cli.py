@@ -598,7 +598,8 @@ def conformance(out: str, to_stdout: bool) -> None:
     \b
     What this settles, and what it doesn't:
       This is the FREE half. It runs on DuckDB, in CI, with no credentials.
-      It is a regression suite for mesa-core's own compiler — NOT a stand-in
+      It pins DuckDB's own behavior, and one row runs the compiler's canonical
+      ID expression against a SHA-256 test vector. It is NOT a stand-in
       for cloud behavior. DuckDB's concat ignores NULL and / returns a double,
       which is not what SQL Server does. Every DOCUMENTED claim about T-SQL,
       Redshift and BigQuery still waits for the cloud run (Slice 8b), which

@@ -21,7 +21,7 @@ wait for Slice 8b, which costs about $1/hr per warehouse and needs approval per 
 
 ## DuckDB 1.5.5
 
-Run 2026-10-29. DuckDB 1.5.5: 9 verified, 0 falsified, 0 skipped.
+Run 2026-10-29. DuckDB 1.5.5: 10 verified, 0 falsified, 0 skipped.
 
 | Case | Check | Status | Expected | Actual |
 |---|---|---|---|---|
@@ -34,6 +34,7 @@ Run 2026-10-29. DuckDB 1.5.5: 9 verified, 0 falsified, 0 skipped.
 | `BOOLEAN` | MIN/MAX on a boolean column | **VERIFIED** | defined (DuckDB) — T-SQL BIT is DOCUMENTED not to be | MIN=False, MAX=True |
 | `ALL_NULL` | signal test fails when non_null = 0 | **VERIFIED** | non_null = 0 (the test must fail) | non_null = 0 |
 | `CONSTANT` | signal test warns when lo = hi | **VERIFIED** | non_null > 0 and lo = hi (the test must warn) | non_null=7, lo='only', hi='only' |
+| `IDENTITY_EXPR` | identity_expr('duckdb') on 'abc' matches the SHA-256 test vector | **VERIFIED** | ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0= | ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0= |
 
 ### What each row means
 
@@ -46,6 +47,7 @@ Run 2026-10-29. DuckDB 1.5.5: 9 verified, 0 falsified, 0 skipped.
 - **`BOOLEAN`** — DuckDB allows MIN/MAX on BOOLEAN. T-SQL BIT is DOCUMENTED not to — that's why the signal macro needs the count-only fallback rather than assuming the single-scan form works everywhere.
 - **`ALL_NULL`** — A dead column must fail the generated signal test. If this row ever reports non_null > 0 the fixture drifted, not the rule.
 - **`CONSTANT`** — Warn, not fail — a constant column is suspicious, not always wrong. ``allow_constant`` silences it for a column that's legitimately constant.
+- **`IDENTITY_EXPR`** — The only row that runs compiler output. A FALSIFIED here means the canonical ID formula changed, which rewrites every ID on DuckDB — SPEC_103 Slice 2 says that must never happen silently.
 
 ## Still DOCUMENTED, not VERIFIED
 

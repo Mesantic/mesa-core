@@ -219,3 +219,66 @@ def test_learn_stub(tmp_path, runner, monkeypatch):
     assert "WELCOME TO MESA LEARN" in result.output
     assert "LESSON 1" in result.output
     assert "completed all 5 lessons" in result.output
+
+
+# ── mesa conformance (SPEC_103 Slice 8a) ────────────────────────────────────
+
+def test_conformance_writes_the_report(tmp_path, runner, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli, ["conformance"])
+    assert result.exit_code == 0, result.output
+    written = tmp_path / "docs" / "WAREHOUSE_BEHAVIOR.md"
+    assert written.exists()
+    assert "DuckDB" in written.read_text()
+    assert "10 verified, 0 falsified" in result.output
+
+
+def test_conformance_stdout_prints_the_report(runner):
+    result = runner.invoke(cli, ["conformance", "--stdout"])
+    assert result.exit_code == 0, result.output
+    assert "# Warehouse behavior" in result.output
+    assert "Still DOCUMENTED, not VERIFIED" in result.output
+
+
+def test_conformance_out_writes_elsewhere(tmp_path, runner):
+    target = tmp_path / "custom" / "wb.md"
+    result = runner.invoke(cli, ["conformance", "--out", str(target)])
+    assert result.exit_code == 0, result.output
+    assert target.exists()
+
+
+# ── SPEC_103 Slice 1: unknown warehouse names fail loudly ───────────────────
+
+def test_compile_rejects_an_unknown_warehouse(tmp_path, runner):
+    """The old behavior passed the name through as-is and compiled Redshift SQL.
+    Uses a REAL entity so the warehouse check is what fails, not the lookup."""
+    models = _write_fixture_project(tmp_path)
+    result = runner.invoke(
+        cli, ["compile", "Customer", "--models-dir", str(models), "--warehouse", "Postgres"]
+    )
+    assert result.exit_code == 2, result.output
+    assert "Unknown warehouse" in result.output
+    assert "dbt_utils.star" not in result.output
+
+
+def test_compile_accepts_the_governance_synapse_spelling(tmp_path, runner):
+    models = _write_fixture_project(tmp_path)
+    result = runner.invoke(
+        cli, ["compile", "Customer", "--models-dir", str(models), "--warehouse", "AzureSynapse"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "dbt_utils.star" not in result.output
+
+
+def test_init_rejects_an_unknown_warehouse(tmp_path, runner):
+    result = runner.invoke(cli, ["init", str(tmp_path / "p"), "--warehouse", "Postgres"])
+    assert result.exit_code == 2
+    assert "Unknown warehouse" in result.output
+    assert "Snowflake" in result.output
+    assert not (tmp_path / "p").exists()
+
+
+def test_init_normalizes_the_governance_synapse_spelling(tmp_path, runner):
+    result = runner.invoke(cli, ["init", str(tmp_path / "p"), "--warehouse", "AzureSynapse"])
+    assert result.exit_code == 0, result.output
+    assert "default_warehouse: Synapse" in (tmp_path / "p" / "mesa_project.yml").read_text()

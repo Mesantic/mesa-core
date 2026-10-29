@@ -3,9 +3,9 @@ test_conformance_duckdb.py — SPEC_103 Slice 8a.
 
 The free, in-CI half of the conformance harness. What this suite is for:
 
-  * It's a regression guard on mesa-core's own compiler and fixture. If a future
-    change makes the compiler emit SQL that assumes a warehouse behavior DuckDB
-    doesn't have, this catches it.
+  * It pins DuckDB's behavior for the claims the specs lean on. Only the
+    IDENTITY_EXPR row executes compiler output (identity_expr against a SHA-256
+    test vector); the rest are raw DuckDB SQL and say nothing about the compiler.
   * It pins the fixture's expected values so a "fix" that quietly changes what
     the fixture measures shows up as a test failure rather than a silently
     different report.

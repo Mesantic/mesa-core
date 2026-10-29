@@ -57,6 +57,31 @@ def test_plain_sum_still_zero_fills():
     assert resolve_combiner_default("SELECT t.ID, SUM(t.Amount) AS Total FROM t", None) == "0"
 
 
+def test_sum_over_a_row_level_division_still_zero_fills():
+    """Sonnet review finding: SUM(AmountCents / 100) is a money total with a unit
+    conversion, NOT a ratio. The division is inside the aggregate, so an empty
+    group is genuinely 0. The first version of the rule flagged any division in
+    the terminal projection and silently dropped this zero-fill."""
+    sql = "SELECT t.ID, SUM(t.AmountCents / 100) AS Total FROM t GROUP BY t.ID"
+    assert resolve_combiner_default(sql, None) == "0"
+
+
+def test_count_over_a_row_level_division_still_zero_fills():
+    sql = "SELECT t.ID, COUNT(CASE WHEN t.A / t.B > 1 THEN 1 END) AS N FROM t GROUP BY t.ID"
+    assert resolve_combiner_default(sql, None) == "0"
+
+
+def test_division_of_two_aggregates_is_still_a_ratio():
+    """The other side of the line: the division is OUTSIDE the aggregates."""
+    sql = "SELECT t.ID, SUM(t.A) / NULLIF(SUM(t.B), 0) AS R FROM t GROUP BY t.ID"
+    assert resolve_combiner_default(sql, None) is None
+
+
+def test_division_wrapped_in_a_cast_is_still_a_ratio():
+    sql = "SELECT t.ID, ROUND(SUM(t.A) / SUM(t.B), 2) AS R FROM t GROUP BY t.ID"
+    assert resolve_combiner_default(sql, None) is None
+
+
 def test_count_still_zero_fills():
     assert resolve_combiner_default("SELECT t.ID, COUNT(t.ID) AS N FROM t", None) == "0"
 

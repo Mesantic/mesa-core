@@ -21,6 +21,10 @@ and checks the terminal projection for a division before it consults the
 heuristic table. A ratio gets no default. Everything else — `SUM`, `COUNT`, a 0/1
 `CASE` flag — keeps its `0`.
 
+A division only counts when it sits *outside* an aggregate. `SUM(a) / SUM(b)` is a
+ratio. `SUM(AmountCents / 100)` is a money total with a unit conversion — the
+division happens per row, and an empty group is genuinely 0 — so it keeps its zero-fill.
+
 **Exactly one metric moves on the real CAO project.** Measured across all 40
 metrics on 2026-10-18:
 
@@ -86,8 +90,10 @@ version and run date. It writes `docs/WAREHOUSE_BEHAVIOR.md` and exits non-zero
 if anything is falsified, so CI catches a regression.
 
 **What this settles, and what it doesn't.** This is the free half. It runs on
-DuckDB, in CI, with no credentials. It is a regression suite for mesa-core's own
-compiler — **not** a stand-in for cloud behavior. DuckDB's `concat` ignores NULL
+DuckDB, in CI, with no credentials. Nine of the ten rows pin raw DuckDB behavior and
+say nothing about the compiler; the tenth (`IDENTITY_EXPR`) runs the compiler's own
+canonical ID expression against a SHA-256 test vector, so a silent change to the ID
+formula fails the run. It is **not** a stand-in for cloud behavior. DuckDB's `concat` ignores NULL
 and `/` returns a double, which is not what SQL Server does. Every DOCUMENTED
 claim about T-SQL, Redshift and BigQuery still waits for the cloud run (Slice 8b,
 about $1/hr per warehouse, approval per run). The generated report says so in its

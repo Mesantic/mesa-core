@@ -105,11 +105,15 @@ def _case(key: str):
 def run_duckdb_conformance() -> ConformanceReport:
     """Slice 8a — the free, in-CI run.
 
-    This is a regression suite for mesa-core's own compiler, NOT a stand-in for
-    cloud behavior. DuckDB's ``concat`` ignores NULL and ``/`` returns a double,
-    which is not what SQL Server does — so a VERIFIED row here says "the compiler
-    and the fixture agree", not "every warehouse does this". The cloud rows wait
-    for 8b.
+    Most rows pin raw DuckDB behavior the specs depend on. Exactly ONE row —
+    ``IDENTITY_EXPR`` — executes SQL that mesa-core's compiler produced
+    (``identity_expr('duckdb', …)``), so a drift in the canonical ID formula
+    shows up here. The other rows do not touch the compiler.
+
+    NOT a stand-in for cloud behavior. DuckDB's ``concat`` ignores NULL and
+    ``/`` returns a double, which is not what SQL Server does — a VERIFIED row
+    says "DuckDB behaves this way", not "every warehouse does this". The cloud
+    rows wait for 8b.
     """
     import duckdb
 
@@ -133,6 +137,7 @@ def run_duckdb_conformance() -> ConformanceReport:
     _check_boolean_min_max(conn, report)
     _check_all_null_signal(conn, report)
     _check_constant_signal(conn, report)
+    _check_identity_expr(conn, report)
 
     conn.close()
     return report
@@ -342,6 +347,35 @@ def _check_boolean_min_max(conn, report: ConformanceReport) -> None:
             expected="defined (DuckDB) — T-SQL BIT is DOCUMENTED not to be",
             actual=actual,
             note=note,
+        )
+    )
+
+def _check_identity_expr(conn, report: ConformanceReport) -> None:
+    """Run the compiler's OWN canonical DuckDB identity expression.
+
+    This is the one row that exercises mesa-core code. ``identity_expr`` is the
+    single source of truth for the entity-ID formula; the expected value is
+    base64 of the raw SHA-256 bytes of 'abc', a published test vector
+    (ba7816bf…15ad), so the check doesn't just compare the compiler to itself.
+    """
+    from mesa_core.compiler.targets.dbt_render import identity_expr
+
+    sql = identity_expr("duckdb", "'abc'")
+    actual = conn.sql(f"SELECT {sql}").fetchone()[0]
+    expected = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+
+    report.results.append(
+        CheckResult(
+            case="IDENTITY_EXPR",
+            check="identity_expr('duckdb') on 'abc' matches the SHA-256 test vector",
+            status=Status.VERIFIED if actual == expected else Status.FALSIFIED,
+            expected=expected,
+            actual=str(actual),
+            note=(
+                "The only row that runs compiler output. A FALSIFIED here means "
+                "the canonical ID formula changed, which rewrites every ID on "
+                "DuckDB — SPEC_103 Slice 2 says that must never happen silently."
+            ),
         )
     )
 
