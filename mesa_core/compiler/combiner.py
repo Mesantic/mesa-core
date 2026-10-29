@@ -27,6 +27,13 @@ from __future__ import annotations
 
 import re
 
+try:
+    import sqlglot
+    from sqlglot import exp as _exp
+    _SQLGLOT_AVAILABLE = True
+except ImportError:  # pragma: no cover — sqlglot is a pinned dependency
+    _SQLGLOT_AVAILABLE = False
+
 COMBINER_DEFAULT_ANNOTATION_RE = re.compile(r"--\s*COMBINER_DEFAULT\s*:\s*([^\n]+)", re.IGNORECASE)
 
 # Heuristic default-value inference, checked in order against the metric's
@@ -54,8 +61,78 @@ DEFAULT_HEURISTICS: list[tuple[re.Pattern, str]] = [
 # never fired in production is the strip bug now fixed in the same slice.
 _NULL_ANNOTATION_VALUES = frozenset({"NONE", "NULL"})
 
+# ── SPEC_101 Slice 1b: ratios never zero-fill ────────────────────────────────
+# A ratio with no rows is not 0 — it's "no data". Zero-filling it is the same
+# class of bug as the 2026-10-07 "open windows shown as lost" defect: a rate for
+# a policy with no events rendered as 0% instead of blank.
+#
+# The defect is DIVISION, not SUM. An earlier note blamed bare `SUM(` because it
+# matched a ratio, but a premium total with no rows genuinely is 0 the same way a
+# count is. Dropping `SUM(` would have broken every money metric to fix one rate.
+#
+# Measured on real CAO (40 metrics, 2026-10-18): 16 got a '0' default, 24 passed
+# NULL through, division appeared in 2. A terminal-projection rule flips exactly
+# ONE — AgentChangeResponseRate. The other division (IsLikelyMoveEvent) lives
+# only inside a CTE and its terminal SELECT is a 0/1 flag, so it correctly keeps
+# its '0'.
+#
+# Jinja is replaced with a placeholder identifier before parsing. The probe got
+# zero parse failures across all 40 real metrics with this approach.
+_JINJA_RE = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+_JINJA_PLACEHOLDER = "__mesa_jinja_ref__"
 
-def resolve_combiner_default(metric_sql: str, annotation: str | None = None) -> str | None:
+# Division-shaped function calls. sqlglot normalizes DIV0/SAFE_DIVIDE to a Div
+# node on most dialects, but not all — check the name too so a dialect that
+# keeps them as Anonymous still trips the rule.
+_DIVISION_FUNCTIONS = frozenset({"DIV0", "SAFE_DIVIDE", "DIVIDE", "ZEROIFNULL_DIV"})
+
+
+def _terminal_projection_has_division(metric_sql: str, dialect: str) -> tuple[bool, str | None]:
+    """Does the metric's TERMINAL SELECT project a division?
+
+    Returns ``(has_division, parse_error)``. ``parse_error`` is a short message
+    when sqlglot couldn't parse the SQL at all — the caller warns rather than
+    swallowing it, because a silent parse failure would quietly restore the
+    zero-fill this rule exists to remove.
+
+    Only the outermost SELECT is inspected. A division inside a CTE is a
+    different thing: the CTE's result is consumed by the terminal projection,
+    and if that projection is a 0/1 flag the metric is a flag, not a ratio.
+    That's the IsLikelyMoveEvent shape, and it keeps its '0'.
+    """
+    if not _SQLGLOT_AVAILABLE:  # pragma: no cover — sqlglot is pinned
+        return False, "sqlglot not installed"
+
+    probe = _JINJA_RE.sub(_JINJA_PLACEHOLDER, metric_sql)
+    try:
+        tree = sqlglot.parse_one(probe, read=dialect)
+    except Exception as exc:  # noqa: BLE001 — any parse failure is the same signal
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if tree is None:
+        return False, "empty parse result"
+
+    select = tree if isinstance(tree, _exp.Select) else tree.find(_exp.Select)
+    if select is None:
+        return False, "no SELECT found"
+
+    for projection in select.expressions:
+        for node in projection.walk():
+            if isinstance(node, _exp.Div):
+                return True, None
+            if isinstance(node, _exp.Anonymous) and str(node.this).upper() in _DIVISION_FUNCTIONS:
+                return True, None
+    return False, None
+
+
+def resolve_combiner_default(
+    metric_sql: str,
+    annotation: str | None = None,
+    *,
+    dialect: str = "snowflake",
+    warnings: list[str] | None = None,
+    metric_label: str | None = None,
+) -> str | None:
     """Returns the literal default expression to ``COALESCE`` with, or
     ``None`` if no default should be applied (metric passes through raw,
     NULL-preserving).
@@ -66,10 +143,22 @@ def resolve_combiner_default(metric_sql: str, annotation: str | None = None) -> 
     header before the compiler ever sees the SQL, so a regex over the body can
     never match a real annotation.
 
+    Resolution order (SPEC_103 Slice 3 extends this same chain to every
+    warehouse, so keep it dialect-neutral):
+      1. annotation, when present
+      2. the ratio rule (SPEC_101 Slice 1b) — a terminal-projection division
+         gets no default, because NULL means "no data"
+      3. the heuristic table
+
     Annotation semantics:
       ``NONE`` / ``NULL`` (case-insensitive) -> ``None`` (deliberate NULL signal)
       anything else                         -> that literal, stripped
-      no annotation                         -> heuristic table (unchanged)
+      no annotation                         -> ratio rule, then heuristic table
+
+    ``dialect`` is the sqlglot dialect to parse with. ``warnings``, when given,
+    collects a message for a ratio (so the author knows why no default was
+    applied) and for a parse failure (so it's never silent). ``metric_label``
+    prefixes those messages, e.g. ``"Policy.NumberOfPolicies"``.
     """
     if annotation is not None:
         value = annotation.strip()
@@ -85,6 +174,28 @@ def resolve_combiner_default(metric_sql: str, annotation: str | None = None) -> 
         if value.upper() in _NULL_ANNOTATION_VALUES:
             return None
         return value
+
+    # SPEC_101 Slice 1b — a ratio gets no default. Checked BEFORE the heuristic
+    # table, because `SUM(a) / SUM(b)` matches the SUM heuristic and would
+    # otherwise be zero-filled.
+    has_division, parse_error = _terminal_projection_has_division(metric_sql, dialect)
+    if parse_error is not None:
+        # Keep today's behavior (fall through to the heuristics) but say so.
+        if warnings is not None:
+            label = f"{metric_label}: " if metric_label else ""
+            warnings.append(
+                f"{label}could not parse metric SQL to check for a ratio "
+                f"({parse_error}) — the default came from the heuristic table. "
+                f"Add '-- COMBINER_DEFAULT: <value>' to pin it."
+            )
+    elif has_division:
+        if warnings is not None:
+            label = f"{metric_label}: " if metric_label else ""
+            warnings.append(
+                f"{label}ratio — no default applied (NULL means 'no data'). "
+                f"Add '-- COMBINER_DEFAULT: 0' if a zero is correct."
+            )
+        return None
 
     for pattern, default in DEFAULT_HEURISTICS:
         if pattern.search(metric_sql):

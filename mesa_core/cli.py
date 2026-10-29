@@ -28,6 +28,7 @@ from pathlib import Path
 import click
 
 from mesa_core import __version__
+from mesa_core.warehouses import UnknownWarehouseError, normalize_warehouse
 
 
 def _load(models_dir: str):
@@ -75,7 +76,7 @@ def cli() -> None:
 @cli.command()
 @click.argument("name")
 @click.option("--warehouse", default="Snowflake",
-              help="Default warehouse dialect (Snowflake|BigQuery|Redshift|DuckDB).")
+              help="Default warehouse dialect (Snowflake|BigQuery|Redshift|Synapse|AzureSQLDatabase|DuckDB).")
 def init(name: str, warehouse: str) -> None:
     """Scaffold a new four-tier project in ./<name>.
 
@@ -99,6 +100,15 @@ def init(name: str, warehouse: str) -> None:
       mesa init warehouse --warehouse Snowflake
     """
     from mesa_core.scaffold import scaffold_project
+
+    # SPEC_103 Slice 1: validate the warehouse before scaffolding. A project
+    # stamped with a name the compiler can't resolve fails later, at build time,
+    # with a much less obvious error.
+    try:
+        warehouse = normalize_warehouse(warehouse)
+    except UnknownWarehouseError as exc:
+        click.echo(click.style(str(exc), fg="red"), err=True)
+        sys.exit(2)
 
     root = Path(name)
     proj_yml = scaffold_project(name, root=root, warehouse=warehouse)
@@ -302,24 +312,17 @@ def compile(entity: str, models_dir: str, warehouse: str, out) -> None:
         click.echo(f"Entity '{entity}' not found.", err=True)
         sys.exit(1)
 
-    # Override warehouse if specified, normalize to expected casing
+    # Override warehouse if specified. SPEC_103 Slice 1: normalize through the
+    # canonical module instead of a local if/elif ladder. The old ladder ended
+    # with `target_warehouse = warehouse  # pass through as-is`, so a typo like
+    # `--warehouse Postgres` compiled as Redshift output with no error. Now an
+    # unknown name raises and the CLI reports the valid list.
     if warehouse:
-        # Normalize warehouse names to match compiler expectations
-        wh_lower = warehouse.lower()
-        if wh_lower == "bigquery":
-            target_warehouse = "BigQuery"
-        elif wh_lower == "snowflake":
-            target_warehouse = "Snowflake"
-        elif wh_lower == "redshift":
-            target_warehouse = "Redshift"
-        elif wh_lower == "duckdb":
-            target_warehouse = "DuckDB"
-        elif wh_lower in ("synapse", "azuresynapse"):
-            target_warehouse = "Synapse"
-        elif wh_lower in ("azuresqldb", "azuresqldatabase", "azure_sql_db", "azuresql"):
-            target_warehouse = "AzureSQLDatabase"
-        else:
-            target_warehouse = warehouse  # pass through as-is
+        try:
+            target_warehouse = normalize_warehouse(warehouse)
+        except UnknownWarehouseError as exc:
+            click.echo(click.style(str(exc), fg="red"), err=True)
+            sys.exit(2)
     else:
         target_warehouse = target.warehouse
 
@@ -577,6 +580,59 @@ def learn(reset: bool, jump: int) -> None:
         reset=reset,
         jump_to=jump,
     )
+
+
+@cli.command()
+@click.option("--out", default=None, metavar="PATH",
+              help="Write the markdown report here (default: docs/WAREHOUSE_BEHAVIOR.md).")
+@click.option("--stdout", "to_stdout", is_flag=True,
+              help="Print the report instead of writing a file.")
+def conformance(out: str, to_stdout: bool) -> None:
+    """Run the warehouse behavior harness (SPEC_103 Slice 8a).
+
+    Runs one deliberately nasty fixture — a NULL natural key, a trailing space,
+    case variants, an integer ratio, a microsecond timestamp, mixed-case struct
+    keys, a boolean column, an all-NULL column, a constant column — and reports
+    each behavior as VERIFIED or FALSIFIED.
+
+    \b
+    What this settles, and what it doesn't:
+      This is the FREE half. It runs on DuckDB, in CI, with no credentials.
+      It is a regression suite for mesa-core's own compiler — NOT a stand-in
+      for cloud behavior. DuckDB's concat ignores NULL and / returns a double,
+      which is not what SQL Server does. Every DOCUMENTED claim about T-SQL,
+      Redshift and BigQuery still waits for the cloud run (Slice 8b), which
+      costs about $1/hr per warehouse.
+
+    \b
+    Examples:
+      mesa conformance                  # write docs/WAREHOUSE_BEHAVIOR.md
+      mesa conformance --stdout         # print it
+      mesa conformance --out /tmp/wb.md # write somewhere else
+
+    Exits non-zero when any check is FALSIFIED, so CI catches a regression.
+    """
+    from mesa_core.conformance import render_markdown, run_duckdb_conformance
+
+    report = run_duckdb_conformance()
+    markdown = render_markdown([report])
+
+    if to_stdout:
+        click.echo(markdown)
+    else:
+        target = Path(out) if out else Path("docs") / "WAREHOUSE_BEHAVIOR.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(markdown)
+        click.echo(f"Wrote {target}")
+
+    click.echo(report.summary())
+    for result in report.falsified:
+        click.echo(click.style(
+            f"FALSIFIED {result.case}: expected {result.expected}, got {result.actual}",
+            fg="red"), err=True)
+
+    if not report.ok:
+        sys.exit(1)
 
 
 def main() -> None:

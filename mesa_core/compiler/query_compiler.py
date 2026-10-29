@@ -23,6 +23,17 @@ Guided authoring:
 
 from mesa_core.model import Entity, Metric
 from mesa_core.model import CompileResult
+from mesa_core.warehouses import (
+    BIGQUERY,
+    DUCKDB,
+    REDSHIFT,
+    SNOWFLAKE,
+    SYNAPSE,
+    TSQL_WAREHOUSES,
+    UnknownWarehouseError,
+    normalize_warehouse,
+    sqlglot_dialect,
+)
 from mesa_core.compiler.expression_format import format_expression
 from mesa_core.compiler.combiner import combiner_model_name, resolve_combiner_default
 from mesa_core.compiler.wide_type import resolve_tsql_type
@@ -32,12 +43,14 @@ from mesa_core.compiler.wide_columns import (
     has_typed_column,
 )
 
-# T-SQL (no native nested type) warehouse strings. Both Synapse Dedicated and
-# Azure SQL Database share the flat-typed-CAST wide-layer shape.
-_TSQL_WAREHOUSES = ("Synapse", "AzureSQLDatabase")
-
 
 def compile_entity(entity: Entity, metrics: list[Metric], warehouse: str) -> CompileResult:
+    # SPEC_103 Slice 1: normalize at the boundary. Before this, an unrecognized
+    # name fell through _build_widetable's final `else` and compiled as Redshift
+    # dbt_utils.star output — a typo produced plausible SQL for the wrong
+    # warehouse and nothing raised. Now it raises before any SQL is emitted.
+    warehouse = normalize_warehouse(warehouse)
+
     metric_layer_sql = _build_metric_layer(entity, metrics)
     widetable_sql, type_inference_warnings = _build_widetable(entity, metrics, warehouse)
 
@@ -46,12 +59,12 @@ def compile_entity(entity: Entity, metrics: list[Metric], warehouse: str) -> Com
     # combiner warehouses (Snowflake + the T-SQL targets). BigQuery/Redshift/DuckDB
     # emit no combiner model, so there is no default to warn about.
     annotation_warnings: list[str] = []
-    if warehouse == "Snowflake":
-        combiner_sql = _build_combiner_snowflake(entity, metrics)
-        annotation_warnings = _combiner_default_warnings(entity, metrics)
-    elif warehouse in _TSQL_WAREHOUSES:
-        combiner_sql = _build_combiner_tsql(entity, metrics)
-        annotation_warnings = _combiner_default_warnings(entity, metrics)
+    if warehouse == SNOWFLAKE:
+        combiner_sql = _build_combiner_snowflake(entity, metrics, warehouse)
+        annotation_warnings = _combiner_default_warnings(entity, metrics, warehouse)
+    elif warehouse in TSQL_WAREHOUSES:
+        combiner_sql = _build_combiner_tsql(entity, metrics, warehouse)
+        annotation_warnings = _combiner_default_warnings(entity, metrics, warehouse)
         # SPEC_76 — the T-SQL combiner's flat-column CAST infers a type per
         # metric; surface any metric that fell back to VARCHAR(MAX) so the
         # caller (CLI/Mesantic) can warn — same discipline as Snowflake.
@@ -149,7 +162,7 @@ def _build_widetable(entity: Entity, metrics: list[Metric], warehouse: str) -> t
         f"-- No explicit columns. Publish a new metric and recompile — this widetable picks it up automatically.\n"
     )
 
-    if warehouse == "BigQuery":
+    if warehouse == BIGQUERY:
         return (
             f"{header}\n"
             f"SELECT\n"
@@ -160,13 +173,13 @@ def _build_widetable(entity: Entity, metrics: list[Metric], warehouse: str) -> t
             f"  ON {metric_ref_name}.ID = {entity.entity_name}.ID\n"
         ), []
 
-    elif warehouse == "Snowflake":
+    elif warehouse == SNOWFLAKE:
         return _build_widetable_snowflake(entity, metrics), []
 
-    elif warehouse in _TSQL_WAREHOUSES:
+    elif warehouse in TSQL_WAREHOUSES:
         return _build_widetable_tsql(entity), []
 
-    else:
+    elif warehouse in (REDSHIFT, DUCKDB):
         # Redshift / DuckDB — qualified wildcard
         return (
             f"{header}\n"
@@ -177,6 +190,11 @@ def _build_widetable(entity: Entity, metrics: list[Metric], warehouse: str) -> t
             f"JOIN {metric_ref} AS {metric_ref_name}\n"
             f"  ON {metric_ref_name}.ID = {entity.entity_name}.ID\n"
         ), []
+
+    # Unreachable: compile_entity normalizes first, so `warehouse` is always one
+    # of the six. Kept as an explicit raise rather than a silent Redshift
+    # fallback — that fallback was the SPEC_103 Slice 1 bug.
+    raise UnknownWarehouseError(warehouse)
 
 
 def _build_widetable_snowflake(entity: Entity, metrics: list[Metric]) -> str:
@@ -287,13 +305,16 @@ def _build_widetable_snowflake(entity: Entity, metrics: list[Metric]) -> str:
     return header + "\n" + body
 
 
-def _build_combiner_snowflake(entity: Entity, metrics: list[Metric]) -> str:
+def _build_combiner_snowflake(entity: Entity, metrics: list[Metric], warehouse: str = SNOWFLAKE) -> str:
     """
     SPEC_72 (combiner architecture) — the per-entity Snowflake metric COMBINER
     model, byte-matching CAO's ``tools/generate_metrics_combiner.py``
     ``build_combiner_sql``. Collapses every metric file for an entity into
     ONE joined, flat-columned model (``<entity_snake>_metrics``) that the wide
     layer then joins to exactly once.
+
+    ``warehouse`` only selects the sqlglot dialect used by the SPEC_101 Slice 1b
+    ratio rule — the emitted SQL is Snowflake either way.
     """
     entity_var = entity.entity_name
     combiner_model = combiner_model_name(entity_var)
@@ -326,12 +347,16 @@ def _build_combiner_snowflake(entity: Entity, metrics: list[Metric]) -> str:
     ]
     cte_block = "WITH " + "\n, ".join(cte_parts)
 
+    dialect = sqlglot_dialect(warehouse)
     select_lines = [f"    {entity_var}.ID"]
     for metric in metrics:
         # SPEC_101 Slice 1: the annotation lives in the file header, which the
         # loader stripped — pass it explicitly rather than regex the body.
+        # Slice 1b: the ratio rule needs the dialect to parse with.
         default = resolve_combiner_default(
-            metric.definition_sql, metric.annotation("COMBINER_DEFAULT")
+            metric.definition_sql,
+            metric.annotation("COMBINER_DEFAULT"),
+            dialect=dialect,
         )
         if default is None:
             select_lines.append(f"    , {metric.metric_name}.{metric.metric_name}")
@@ -408,24 +433,41 @@ def _tsql_type_warnings(entity: Entity, metrics: list[Metric]) -> list[str]:
     return warnings
 
 
-def _combiner_default_warnings(entity: Entity, metrics: list[Metric]) -> list[str]:
-    """SPEC_101 Slice 1 — warn when a combiner default came from the HEURISTIC
-    table rather than an explicit annotation.
+def _combiner_default_warnings(
+    entity: Entity, metrics: list[Metric], warehouse: str
+) -> list[str]:
+    """SPEC_101 Slice 1 + 1b — the ONE place combiner-default warnings are made.
 
-    The heuristic is unchanged and still applied (removing it would break every
-    existing project the day it shipped); this only makes the guess visible so
-    an author can pin it. Metrics that pass NULL through produce no warning —
-    there's no inferred value to confirm. Deterministic (metric order kept).
+    Two distinct messages, both a nudge to annotate and never a block:
+
+      * **ratio** (Slice 1b) — the terminal projection divides, so no default
+        was applied. NULL means "no data" and that's the correct answer; the
+        warning exists so an author who genuinely wants 0 can say so.
+      * **inferred** (Slice 1) — the default came from the heuristic table
+        rather than an annotation. The heuristic is unchanged and still applied
+        (removing it would break every existing project the day it shipped);
+        this only makes the guess visible.
+
+    Metrics that pass NULL through with no ratio produce no warning — there's no
+    inferred value to confirm. Deterministic (metric order kept).
     """
+    dialect = sqlglot_dialect(warehouse)
     warnings: list[str] = []
     for metric in metrics:
         if metric.annotation("COMBINER_DEFAULT") is not None:
             continue  # explicit — the author already decided
-        inferred = resolve_combiner_default(metric.definition_sql, None)
+        label = f"{entity.entity_name}.{metric.metric_name}"
+        inferred = resolve_combiner_default(
+            metric.definition_sql,
+            None,
+            dialect=dialect,
+            warnings=warnings,
+            metric_label=label,
+        )
         if inferred is None:
-            continue  # NULL passes through; nothing to confirm
+            continue  # ratio warning (if any) already appended; else NULL passes through
         warnings.append(
-            f"{entity.entity_name}.{metric.metric_name}: COMBINER_DEFAULT inferred as "
+            f"{label}: COMBINER_DEFAULT inferred as "
             f"{inferred} — add '-- COMBINER_DEFAULT: {inferred}' to confirm, or "
             f"'-- COMBINER_DEFAULT: NONE' if NULL is meaningful."
         )
@@ -446,7 +488,7 @@ def _tsql_coalesce_default(tsql_type: str) -> str:
     return "0"
 
 
-def _build_combiner_tsql(entity: Entity, metrics: list[Metric]) -> str:
+def _build_combiner_tsql(entity: Entity, metrics: list[Metric], warehouse: str = SYNAPSE) -> str:
     """
     SPEC_76 — the per-entity T-SQL typed metric COMBINER model
     (``<entity_snake>_metrics``), the flat-typed-CAST sibling of the Snowflake
@@ -455,6 +497,9 @@ def _build_combiner_tsql(entity: Entity, metrics: list[Metric]) -> str:
     via ``CAST(COALESCE(m, dflt) AS <tsql_type>) AS m``. Flags → BIT, counts →
     BIGINT, money → DECIMAL(18,2), rates → DECIMAL(8,2), date deltas → INT,
     averages → FLOAT; NULL passes through where a zero-fill would be wrong.
+
+    ``warehouse`` only selects the sqlglot dialect used by the SPEC_101 Slice 1b
+    ratio rule — the emitted SQL is T-SQL either way.
     """
     entity_var = entity.entity_name
     combiner_model = combiner_model_name(entity_var)
@@ -485,13 +530,16 @@ def _build_combiner_tsql(entity: Entity, metrics: list[Metric]) -> str:
     # Each metric column is emitted as CAST(COALESCE(m.dflt) AS type). The
     # COALESCE default is applied only when the metric has a safe zero-fill
     # (flag/count/money/rate); scores/averages/deltas pass NULL through.
+    dialect = sqlglot_dialect(warehouse)
     select_lines = [f"    {entity_var}.ID AS ID"]
     for metric in metrics:
         tsql_type, _inferred = resolve_tsql_type(
             metric.definition_sql, metric.annotation("WIDE_TYPE_TSQL")
         )
         default = resolve_combiner_default(
-            metric.definition_sql, metric.annotation("COMBINER_DEFAULT")
+            metric.definition_sql,
+            metric.annotation("COMBINER_DEFAULT"),
+            dialect=dialect,
         )
         if default is None:
             select_lines.append(

@@ -67,6 +67,8 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from mesa_core.warehouses import try_sqlglot_dialect
+
 try:
     import sqlglot
     import sqlglot.expressions as exp
@@ -85,39 +87,29 @@ CODE_GRAIN_CANNOT_VERIFY = "MESA_GRAIN_CANNOT_VERIFY"
 _RISKY_CARDINALITIES = {"one_to_many", "many_to_many"}
 
 # ── Warehouse -> sqlglot dialect mapping ─────────────────────────────────────
-# Entity.warehouse / the Literal["BigQuery","Snowflake","Redshift","DuckDB"]
-# used across api/models/schemas.py must map to sqlglot's own dialect names
-# (all four are first-class sqlglot dialects — verified 2026-08-11: unlike
-# sqlfluff, whose Redshift support is partial and falls back to "ansi" in
-# sql_formatter.py's _DIALECT_MAP, sqlglot parses redshift natively).
-# Mirrors compiler/targets/dbt_render.py's dialect_from_connector() intent,
-# but keyed on the warehouse string already stored on Entity/EntityCreate
-# rather than requiring a live WarehouseConnector instance.
-_WAREHOUSE_TO_SQLGLOT_DIALECT = {
-    "bigquery": "bigquery",
-    "snowflake": "snowflake",
-    "redshift": "redshift",
-    "duckdb": "duckdb",
-    "azuresqldb": "tsql",
-}
-
+# SPEC_103 Slice 1: this used to be a private dict keyed on lowercased warehouse
+# strings, and it only knew `azuresqldb` for the T-SQL family. Every other T-SQL
+# spelling — `Synapse`, `AzureSynapse`, `AzureSQLDatabase` — returned None, so
+# grain_guard silently fell back to probing every dialect instead of parsing as
+# T-SQL. The mapping now lives in mesa_core.warehouses, which knows all six
+# canonical names and their aliases.
+#
 # Dialects to try, in order, when no warehouse hint is given (backfill /
 # legacy callers) or when the hinted dialect fails to parse. bigquery first
 # (historical default — matches the old hardcoded behavior for callers that
 # don't pass a warehouse), then the others, so we still recover gracefully
 # instead of only ever falling to the regex extractor.
-_DIALECT_PROBE_ORDER = ("bigquery", "snowflake", "redshift", "duckdb")
+_DIALECT_PROBE_ORDER = ("bigquery", "snowflake", "redshift", "duckdb", "tsql")
 
 
 def _sqlglot_dialect_for_warehouse(warehouse: str | None) -> str | None:
     """Map an Entity.warehouse string to a sqlglot dialect name.
 
-    Case-insensitive; unrecognized/None returns None (caller falls back to
-    probing every known dialect rather than guessing wrong).
+    Case-insensitive and alias-aware (``AzureSynapse`` and ``azuresqldb`` both
+    resolve to ``tsql``). Unrecognized/None returns None so the caller falls
+    back to probing every known dialect rather than guessing wrong.
     """
-    if not warehouse:
-        return None
-    return _WAREHOUSE_TO_SQLGLOT_DIALECT.get(warehouse.strip().lower())
+    return try_sqlglot_dialect(warehouse)
 
 
 # ── Cross-row aggregate / collapse functions, per platform ──────────────────
