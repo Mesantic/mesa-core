@@ -16,4 +16,4 @@ aiosqlite, pydantic, or anything under ``api.*``. It is a pure, stateless,
 one-shot compiler.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
